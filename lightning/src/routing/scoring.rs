@@ -513,6 +513,10 @@ pub struct ProbabilisticScoringParameters {
 	/// (C-not exported)
 	pub manual_node_penalties: HashMap<NodeId, u64>,
 
+	/// Allows to add additional penalty to Nodes on top of the calculated penalty. This is useful to
+	/// discourage or encourage routing through certain nodes.
+	pub additional_node_penalties: HashMap<NodeId, u64>,
+
 	/// This penalty is applied when `htlc_maximum_msat` is equal to or larger than half of the
 	/// channel's capacity, which makes us prefer nodes with a smaller `htlc_maximum_msat`. We
 	/// treat such nodes preferentially as this makes balance discovery attacks harder to execute,
@@ -772,6 +776,16 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Deref, T: Time> ProbabilisticScorerU
 		self.params.manual_node_penalties.insert(*node_id, penalty);
 	}
 
+	/// Set additional manual penalties for the given nodes.
+	pub fn set_additional_manual_penalties(&mut self, node_id: &NodeId, penalty: u64) {
+		self.params.additional_node_penalties.insert(*node_id, penalty);
+	}
+
+	/// Remove additional manual penalties for the given nodes.
+	pub fn remove_additional_manual_penalties(&mut self, node_id: &NodeId) {
+		self.params.additional_node_penalties.remove(node_id);
+	}
+
 	/// Removes the node with the given `node_id` from the list of manual penalties.
 	pub fn remove_manual_penalty(&mut self, node_id: &NodeId) {
 		self.params.manual_node_penalties.remove(node_id);
@@ -798,6 +812,7 @@ impl ProbabilisticScoringParameters {
 			manual_node_penalties: HashMap::new(),
 			anti_probing_penalty_msat: 0,
 			considered_impossible_penalty_msat: 0,
+    		additional_node_penalties: HashMap::new(),
 		}
 	}
 
@@ -824,6 +839,7 @@ impl Default for ProbabilisticScoringParameters {
 			manual_node_penalties: HashMap::new(),
 			anti_probing_penalty_msat: 250,
 			considered_impossible_penalty_msat: 1_0000_0000_000,
+    		additional_node_penalties: HashMap::new(),
 		}
 	}
 }
@@ -1100,6 +1116,9 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Deref, T: Time> Score for Probabilis
 			return *penalty;
 		}
 
+		let additional_penalty_msat = self.params.additional_node_penalties.get(target)
+			.map(|v| *v).unwrap_or(0);
+
 		let base_penalty_msat = self.params.base_penalty_msat.saturating_add(
 			self.params.base_penalty_amount_multiplier_msat
 				.saturating_mul(usage.amount_msat) / BASE_AMOUNT_PENALTY_DIVISOR);
@@ -1131,6 +1150,7 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Deref, T: Time> Score for Probabilis
 			.penalty_msat(amount_msat, &self.params)
 			.saturating_add(anti_probing_penalty_msat)
 			.saturating_add(base_penalty_msat)
+			.saturating_add(additional_penalty_msat)
 	}
 
 	fn payment_path_failed(&mut self, path: &[&RouteHop], short_channel_id: u64) {
