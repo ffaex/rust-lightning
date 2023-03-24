@@ -1,6 +1,10 @@
 [package]
 name = "lightning-background-processor"
+<<<<<<< HEAD
 version = "0.0.113"
+=======
+version = "0.0.114"
+>>>>>>> 3d479c9de62665214e8589699cdbb8a797b77188
 authors = ["Valentine Wallace <vwallace@protonmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "http://github.com/lightningdevkit/rust-lightning"
@@ -15,8 +19,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 futures = [ "futures-util" ]
+std = ["lightning/std", "lightning-rapid-gossip-sync/std"]
+
+default = ["std"]
 
 [dependencies]
+<<<<<<< HEAD
 bitcoin = "0.29.0"
 lightning = { version = "0.0.113", path = "../lightning", features = ["std"] }
 lightning-rapid-gossip-sync = { version = "0.0.113", path = "../lightning-rapid-gossip-sync" }
@@ -26,3 +34,14 @@ futures-util = { version = "0.3", default-features = false, features = ["async-a
 lightning = { version = "0.0.113", path = "../lightning", features = ["_test_utils"] }
 lightning-invoice = { version = "0.21.0", path = "../lightning-invoice" }
 lightning-persister = { version = "0.0.113", path = "../lightning-persister" }
+=======
+bitcoin = { version = "0.29.0", default-features = false }
+lightning = { version = "0.0.114", path = "../lightning", default-features = false }
+lightning-rapid-gossip-sync = { version = "0.0.114", path = "../lightning-rapid-gossip-sync", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["async-await-macro"], optional = true }
+
+[dev-dependencies]
+lightning = { version = "0.0.114", path = "../lightning", features = ["_test_utils"] }
+lightning-invoice = { version = "0.22.0", path = "../lightning-invoice" }
+lightning-persister = { version = "0.0.114", path = "../lightning-persister" }
+>>>>>>> 3d479c9de62665214e8589699cdbb8a797b77188

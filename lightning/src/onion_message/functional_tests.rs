@@ -9,7 +9,7 @@
 
 //! Onion message testing and test utilities live here.
 
-use crate::chain::keysinterface::{KeysInterface, Recipient};
+use crate::chain::keysinterface::{NodeSigner, Recipient};
 use crate::ln::features::InitFeatures;
 use crate::ln::msgs::{self, DecodeError, OnionMessageHandler};
 use super::{BlindedPath, CustomOnionMessageContents, CustomOnionMessageHandler, Destination, OnionMessageContents, OnionMessenger, SendError};
@@ -20,18 +20,18 @@ use bitcoin::network::constants::Network;
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 
 use crate::io;
+use crate::io_extras::read_to_end;
 use crate::sync::Arc;
 
 struct MessengerNode {
 	keys_manager: Arc<test_utils::TestKeysInterface>,
-	messenger: OnionMessenger<Arc<test_utils::TestKeysInterface>, Arc<test_utils::TestLogger>, Arc<TestCustomMessageHandler>>,
+	messenger: OnionMessenger<Arc<test_utils::TestKeysInterface>, Arc<test_utils::TestKeysInterface>, Arc<test_utils::TestLogger>, Arc<TestCustomMessageHandler>>,
 	logger: Arc<test_utils::TestLogger>,
 }
 
 impl MessengerNode {
 	fn get_node_pk(&self) -> PublicKey {
-		let secp_ctx = Secp256k1::new();
-		PublicKey::from_secret_key(&secp_ctx, &self.keys_manager.get_node_secret(Recipient::Node).unwrap())
+		self.keys_manager.get_node_id(Recipient::Node).unwrap()
 	}
 }
 
@@ -60,8 +60,7 @@ impl CustomOnionMessageHandler for TestCustomMessageHandler {
 	fn handle_custom_message(&self, _msg: Self::CustomMessage) {}
 	fn read_custom_message<R: io::Read>(&self, message_type: u64, buffer: &mut R) -> Result<Option<Self::CustomMessage>, DecodeError> where Self: Sized {
 		if message_type == CUSTOM_MESSAGE_TYPE {
-			let mut buf = Vec::new();
-			buffer.read_to_end(&mut buf)?;
+			let buf = read_to_end(buffer)?;
 			assert_eq!(buf, CUSTOM_MESSAGE_CONTENTS);
 			return Ok(Some(TestCustomMessage {}))
 		}
@@ -77,7 +76,7 @@ fn create_nodes(num_messengers: u8) -> Vec<MessengerNode> {
 		let keys_manager = Arc::new(test_utils::TestKeysInterface::new(&seed, Network::Testnet));
 		nodes.push(MessengerNode {
 			keys_manager: keys_manager.clone(),
-			messenger: OnionMessenger::new(keys_manager, logger.clone(), Arc::new(TestCustomMessageHandler {})),
+			messenger: OnionMessenger::new(keys_manager.clone(), keys_manager.clone(), logger.clone(), Arc::new(TestCustomMessageHandler {})),
 			logger,
 		});
 	}
@@ -86,8 +85,8 @@ fn create_nodes(num_messengers: u8) -> Vec<MessengerNode> {
 		let mut features = InitFeatures::empty();
 		features.set_onion_messages_optional();
 		let init_msg = msgs::Init { features, remote_network_address: None };
-		nodes[i].messenger.peer_connected(&nodes[i + 1].get_node_pk(), &init_msg.clone()).unwrap();
-		nodes[i + 1].messenger.peer_connected(&nodes[i].get_node_pk(), &init_msg.clone()).unwrap();
+		nodes[i].messenger.peer_connected(&nodes[i + 1].get_node_pk(), &init_msg.clone(), true).unwrap();
+		nodes[i + 1].messenger.peer_connected(&nodes[i].get_node_pk(), &init_msg.clone(), false).unwrap();
 	}
 	nodes
 }
@@ -105,8 +104,8 @@ fn pass_along_path(path: &Vec<MessengerNode>, expected_path_id: Option<[u8; 32]>
 		node.messenger.handle_onion_message(&prev_node.get_node_pk(), &onion_msg);
 		if idx == num_nodes - 1 {
 			node.logger.assert_log_contains(
-				"lightning::onion_message::messenger".to_string(),
-				format!("Received an onion message with path_id: {:02x?}", expected_path_id).to_string(), 1);
+				"lightning::onion_message::messenger",
+				&format!("Received an onion message with path_id: {:02x?}", expected_path_id), 1);
 		}
 		prev_node = node;
 	}
@@ -219,8 +218,8 @@ fn reply_path() {
 	pass_along_path(&nodes, None);
 	// Make sure the last node successfully decoded the reply path.
 	nodes[3].logger.assert_log_contains(
-		"lightning::onion_message::messenger".to_string(),
-		format!("Received an onion message with path_id None and a reply_path").to_string(), 1);
+		"lightning::onion_message::messenger",
+		&format!("Received an onion message with path_id None and a reply_path"), 1);
 
 	// Destination::BlindedPath
 	let blinded_path = BlindedPath::new(&[nodes[1].get_node_pk(), nodes[2].get_node_pk(), nodes[3].get_node_pk()], &*nodes[3].keys_manager, &secp_ctx).unwrap();
@@ -229,8 +228,8 @@ fn reply_path() {
 	nodes[0].messenger.send_onion_message(&[], Destination::BlindedPath(blinded_path), OnionMessageContents::Custom(test_msg), Some(reply_path)).unwrap();
 	pass_along_path(&nodes, None);
 	nodes[3].logger.assert_log_contains(
-		"lightning::onion_message::messenger".to_string(),
-		format!("Received an onion message with path_id None and a reply_path").to_string(), 2);
+		"lightning::onion_message::messenger",
+		&format!("Received an onion message with path_id None and a reply_path"), 2);
 }
 
 #[test]

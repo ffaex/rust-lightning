@@ -8,7 +8,7 @@
 // licenses.
 
 //! Various utilities for building scripts and deriving keys related to channels. These are
-//! largely of interest for those implementing chain::keysinterface::Sign message signing by hand.
+//! largely of interest for those implementing the traits on [`chain::keysinterface`] by hand.
 
 use bitcoin::blockdata::script::{Script,Builder};
 use bitcoin::blockdata::opcodes;
@@ -660,13 +660,17 @@ pub fn make_funding_redeemscript(broadcaster: &PublicKey, countersignatory: &Pub
 	let broadcaster_funding_key = broadcaster.serialize();
 	let countersignatory_funding_key = countersignatory.serialize();
 
+	make_funding_redeemscript_from_slices(&broadcaster_funding_key, &countersignatory_funding_key)
+}
+
+pub(crate) fn make_funding_redeemscript_from_slices(broadcaster_funding_key: &[u8], countersignatory_funding_key: &[u8]) -> Script {
 	let builder = Builder::new().push_opcode(opcodes::all::OP_PUSHNUM_2);
 	if broadcaster_funding_key[..] < countersignatory_funding_key[..] {
-		builder.push_slice(&broadcaster_funding_key)
-			.push_slice(&countersignatory_funding_key)
+		builder.push_slice(broadcaster_funding_key)
+			.push_slice(countersignatory_funding_key)
 	} else {
-		builder.push_slice(&countersignatory_funding_key)
-			.push_slice(&broadcaster_funding_key)
+		builder.push_slice(countersignatory_funding_key)
+			.push_slice(broadcaster_funding_key)
 	}.push_opcode(opcodes::all::OP_PUSHNUM_2).push_opcode(opcodes::all::OP_CHECKMULTISIG).into_script()
 }
 
@@ -807,7 +811,7 @@ pub fn build_anchor_input_witness(funding_key: &PublicKey, funding_sig: &Signatu
 ///
 /// Normally, this is converted to the broadcaster/countersignatory-organized DirectedChannelTransactionParameters
 /// before use, via the as_holder_broadcastable and as_counterparty_broadcastable functions.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelTransactionParameters {
 	/// Holder public keys
 	pub holder_pubkeys: ChannelPublicKeys,
@@ -831,7 +835,7 @@ pub struct ChannelTransactionParameters {
 }
 
 /// Late-bound per-channel counterparty data used to build transactions.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CounterpartyChannelTransactionParameters {
 	/// Counter-party public keys
 	pub pubkeys: ChannelPublicKeys,
@@ -1635,7 +1639,7 @@ mod tests {
 	use crate::ln::chan_utils::{get_htlc_redeemscript, get_to_countersignatory_with_anchors_redeemscript, CommitmentTransaction, TxCreationKeys, ChannelTransactionParameters, CounterpartyChannelTransactionParameters, HTLCOutputInCommitment};
 	use bitcoin::secp256k1::{PublicKey, SecretKey, Secp256k1};
 	use crate::util::test_utils;
-	use crate::chain::keysinterface::{KeysInterface, BaseSign};
+	use crate::chain::keysinterface::{ChannelSigner, SignerProvider};
 	use bitcoin::{Network, Txid};
 	use bitcoin::hashes::Hash;
 	use crate::ln::PaymentHash;

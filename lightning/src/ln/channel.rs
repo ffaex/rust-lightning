@@ -27,7 +27,7 @@ use crate::ln::features::{ChannelTypeFeatures, InitFeatures};
 use crate::ln::msgs;
 use crate::ln::msgs::{DecodeError, OptionalField, DataLossProtect};
 use crate::ln::script::{self, ShutdownScript};
-use crate::ln::channelmanager::{self, CounterpartyForwardingInfo, PendingHTLCStatus, HTLCSource, HTLCFailureMsg, PendingHTLCInfo, RAACommitmentOrder, BREAKDOWN_TIMEOUT, MIN_CLTV_EXPIRY_DELTA, MAX_LOCAL_BREAKDOWN_TIMEOUT};
+use crate::ln::channelmanager::{self, CounterpartyForwardingInfo, PendingHTLCStatus, HTLCSource, SentHTLCId, HTLCFailureMsg, PendingHTLCInfo, RAACommitmentOrder, BREAKDOWN_TIMEOUT, MIN_CLTV_EXPIRY_DELTA, MAX_LOCAL_BREAKDOWN_TIMEOUT};
 use crate::ln::chan_utils::{CounterpartyCommitmentSecrets, TxCreationKeys, HTLCOutputInCommitment, htlc_success_tx_weight, htlc_timeout_tx_weight, make_funding_redeemscript, ChannelPublicKeys, CommitmentTransaction, HolderCommitmentTransaction, ChannelTransactionParameters, CounterpartyChannelTransactionParameters, MAX_HTLCS, get_commitment_transaction_number_obscure_factor, ClosingTransaction};
 use crate::ln::chan_utils;
 use crate::ln::onion_utils::HTLCFailReason;
@@ -35,7 +35,8 @@ use crate::chain::BestBlock;
 use crate::chain::chaininterface::{FeeEstimator, ConfirmationTarget, LowerBoundedFeeEstimator};
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS};
 use crate::chain::transaction::{OutPoint, TransactionData};
-use crate::chain::keysinterface::{Sign, KeysInterface, BaseSign};
+use crate::chain::keysinterface::{WriteableEcdsaChannelSigner, EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
+use crate::routing::gossip::NodeId;
 use crate::util::events::ClosureReason;
 use crate::util::ser::{Readable, ReadableArgs, Writeable, Writer, VecWriter};
 use crate::util::logger::Logger;
@@ -191,6 +192,7 @@ enum OutboundHTLCState {
 
 #[derive(Clone)]
 enum OutboundHTLCOutcome {
+	/// LDK version 0.0.105+ will always fill in the preimage here.
 	Success(Option<PaymentPreimage>),
 	Failure(HTLCFailReason),
 }
@@ -392,33 +394,19 @@ enum UpdateFulfillFetch {
 }
 
 /// The return type of get_update_fulfill_htlc_and_commit.
-pub enum UpdateFulfillCommitFetch {
+pub enum UpdateFulfillCommitFetch<'a> {
 	/// Indicates the HTLC fulfill is new, and either generated an update_fulfill message, placed
 	/// it in the holding cell, or re-generated the update_fulfill message after the same claim was
 	/// previously placed in the holding cell (and has since been removed).
 	NewClaim {
 		/// The ChannelMonitorUpdate which places the new payment preimage in the channel monitor
-		monitor_update: ChannelMonitorUpdate,
+		monitor_update: &'a ChannelMonitorUpdate,
 		/// The value of the HTLC which was claimed, in msat.
 		htlc_value_msat: u64,
-		/// The update_fulfill message and commitment_signed message (if the claim was not placed
-		/// in the holding cell).
-		msgs: Option<(msgs::UpdateFulfillHTLC, msgs::CommitmentSigned)>,
 	},
 	/// Indicates the HTLC fulfill is duplicative and already existed either in the holding cell
 	/// or has been forgotten (presumably previously claimed).
 	DuplicateClaim {},
-}
-
-/// The return value of `revoke_and_ack` on success, primarily updates to other channels or HTLC
-/// state.
-pub(super) struct RAAUpdates {
-	pub commitment_update: Option<msgs::CommitmentUpdate>,
-	pub accepted_htlcs: Vec<(PendingHTLCInfo, u64)>,
-	pub failed_htlcs: Vec<(HTLCSource, PaymentHash, HTLCFailReason)>,
-	pub finalized_claimed_htlcs: Vec<HTLCSource>,
-	pub monitor_update: ChannelMonitorUpdate,
-	pub holding_cell_failed_htlcs: Vec<(HTLCSource, PaymentHash)>,
 }
 
 /// The return value of `monitor_updating_restored`
@@ -498,7 +486,7 @@ pub(crate) const EXPIRE_PREV_CONFIG_TICKS: usize = 5;
 //
 // Holder designates channel data owned for the benefice of the user client.
 // Counterparty designates channel data owned by the another channel participant entity.
-pub(super) struct Channel<Signer: Sign> {
+pub(super) struct Channel<Signer: ChannelSigner> {
 	config: LegacyChannelConfig,
 
 	// Track the previous `ChannelConfig` so that we can continue forwarding HTLCs that were
@@ -557,6 +545,11 @@ pub(super) struct Channel<Signer: Sign> {
 	monitor_pending_channel_ready: bool,
 	monitor_pending_revoke_and_ack: bool,
 	monitor_pending_commitment_signed: bool,
+
+	// TODO: If a channel is drop'd, we don't know whether the `ChannelMonitor` is ultimately
+	// responsible for some of the HTLCs here or not - we don't know whether the update in question
+	// completed or not. We currently ignore these fields entirely when force-closing a channel,
+	// but need to handle this somehow or we run the risk of losing HTLCs!
 	monitor_pending_forwards: Vec<(PendingHTLCInfo, u64)>,
 	monitor_pending_failures: Vec<(HTLCSource, PaymentHash, HTLCFailReason)>,
 	monitor_pending_finalized_fulfills: Vec<HTLCSource>,
@@ -740,8 +733,14 @@ pub(super) struct Channel<Signer: Sign> {
 	channel_ready_event_emitted: bool,
 
 	/// The unique identifier used to re-derive the private key material for the channel through
-	/// [`KeysInterface::derive_channel_signer`].
+	/// [`SignerProvider::derive_channel_signer`].
 	channel_keys_id: [u8; 32],
+
+	/// When we generate [`ChannelMonitorUpdate`]s to persist, they may not be persisted immediately.
+	/// If we then persist the [`channelmanager::ChannelManager`] and crash before the persistence
+	/// completes we still need to be able to complete the persistence. Thus, we have to keep a
+	/// copy of the [`ChannelMonitorUpdate`] here until it is complete.
+	pending_monitor_updates: Vec<ChannelMonitorUpdate>,
 }
 
 #[cfg(any(test, fuzzing))]
@@ -798,7 +797,7 @@ pub const MAX_CHAN_DUST_LIMIT_SATOSHIS: u64 = MAX_STD_OUTPUT_DUST_LIMIT_SATOSHIS
 /// In order to avoid having to concern ourselves with standardness during the closing process, we
 /// simply require our counterparty to use a dust limit which will leave any segwit output
 /// standard.
-/// See https://github.com/lightning/bolts/issues/905 for more details.
+/// See <https://github.com/lightning/bolts/issues/905> for more details.
 pub const MIN_CHAN_DUST_LIMIT_SATOSHIS: u64 = 354;
 
 // Just a reasonable implementation-specific safe lower bound, higher than the dust limit.
@@ -832,7 +831,7 @@ macro_rules! secp_check {
 	};
 }
 
-impl<Signer: Sign> Channel<Signer> {
+impl<Signer: WriteableEcdsaChannelSigner> Channel<Signer> {
 	/// Returns the value to use for `holder_max_htlc_value_in_flight_msat` as a percentage of the
 	/// `channel_value_satoshis` in msat, set through
 	/// [`ChannelHandshakeConfig::max_inbound_htlc_value_in_flight_percent_of_channel`]
@@ -877,15 +876,29 @@ impl<Signer: Sign> Channel<Signer> {
 		self.channel_transaction_parameters.opt_anchors.is_some()
 	}
 
-	fn get_initial_channel_type(config: &UserConfig) -> ChannelTypeFeatures {
+	fn get_initial_channel_type(config: &UserConfig, their_features: &InitFeatures) -> ChannelTypeFeatures {
 		// The default channel type (ie the first one we try) depends on whether the channel is
 		// public - if it is, we just go with `only_static_remotekey` as it's the only option
 		// available. If it's private, we first try `scid_privacy` as it provides better privacy
-		// with no other changes, and fall back to `only_static_remotekey`
+		// with no other changes, and fall back to `only_static_remotekey`.
 		let mut ret = ChannelTypeFeatures::only_static_remote_key();
-		if !config.channel_handshake_config.announced_channel && config.channel_handshake_config.negotiate_scid_privacy {
+		if !config.channel_handshake_config.announced_channel &&
+			config.channel_handshake_config.negotiate_scid_privacy &&
+			their_features.supports_scid_privacy() {
 			ret.set_scid_privacy_required();
 		}
+
+		// Optionally, if the user would like to negotiate the `anchors_zero_fee_htlc_tx` option, we
+		// set it now. If they don't understand it, we'll fall back to our default of
+		// `only_static_remotekey`.
+		#[cfg(anchors)]
+		{ // Attributes are not allowed on if expressions on our current MSRV of 1.41.
+			if config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx &&
+				their_features.supports_anchors_zero_fee_htlc_tx() {
+				ret.set_anchors_zero_fee_htlc_tx_required();
+			}
+		}
+
 		ret
 	}
 
@@ -898,24 +911,40 @@ impl<Signer: Sign> Channel<Signer> {
 			// We've exhausted our options
 			return Err(());
 		}
-		self.channel_type = ChannelTypeFeatures::only_static_remote_key(); // We only currently support two types
+		// We support opening a few different types of channels. Try removing our additional
+		// features one by one until we've either arrived at our default or the counterparty has
+		// accepted one.
+		//
+		// Due to the order below, we may not negotiate `option_anchors_zero_fee_htlc_tx` if the
+		// counterparty doesn't support `option_scid_privacy`. Since `get_initial_channel_type`
+		// checks whether the counterparty supports every feature, this would only happen if the
+		// counterparty is advertising the feature, but rejecting channels proposing the feature for
+		// whatever reason.
+		if self.channel_type.supports_anchors_zero_fee_htlc_tx() {
+			self.channel_type.clear_anchors_zero_fee_htlc_tx();
+			assert!(self.channel_transaction_parameters.opt_non_zero_fee_anchors.is_none());
+			self.channel_transaction_parameters.opt_anchors = None;
+		} else if self.channel_type.supports_scid_privacy() {
+			self.channel_type.clear_scid_privacy();
+		} else {
+			self.channel_type = ChannelTypeFeatures::only_static_remote_key();
+		}
 		Ok(self.get_open_channel(chain_hash))
 	}
 
 	// Constructors:
-	pub fn new_outbound<K: Deref, F: Deref>(
-		fee_estimator: &LowerBoundedFeeEstimator<F>, keys_provider: &K, counterparty_node_id: PublicKey, their_features: &InitFeatures,
+	pub fn new_outbound<ES: Deref, SP: Deref, F: Deref>(
+		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP, counterparty_node_id: PublicKey, their_features: &InitFeatures,
 		channel_value_satoshis: u64, push_msat: u64, user_id: u128, config: &UserConfig, current_chain_height: u32,
 		outbound_scid_alias: u64
 	) -> Result<Channel<Signer>, APIError>
-	where K::Target: KeysInterface<Signer = Signer>,
+	where ES::Target: EntropySource,
+	      SP::Target: SignerProvider<Signer = Signer>,
 	      F::Target: FeeEstimator,
 	{
-		let opt_anchors = false; // TODO - should be based on features
-
 		let holder_selected_contest_delay = config.channel_handshake_config.our_to_self_delay;
-		let channel_keys_id = keys_provider.generate_channel_keys_id(false, channel_value_satoshis, user_id);
-		let holder_signer = keys_provider.derive_channel_signer(channel_value_satoshis, channel_keys_id);
+		let channel_keys_id = signer_provider.generate_channel_keys_id(false, channel_value_satoshis, user_id);
+		let holder_signer = signer_provider.derive_channel_signer(channel_value_satoshis, channel_keys_id);
 		let pubkeys = holder_signer.pubkeys().clone();
 
 		if !their_features.supports_wumbo() && channel_value_satoshis > MAX_FUNDING_SATOSHIS_NO_WUMBO {
@@ -938,19 +967,22 @@ impl<Signer: Sign> Channel<Signer> {
 			return Err(APIError::APIMisuseError { err: format!("Holder selected channel  reserve below implemention limit dust_limit_satoshis {}", holder_selected_channel_reserve_satoshis) });
 		}
 
+		let channel_type = Self::get_initial_channel_type(&config, their_features);
+		debug_assert!(channel_type.is_subset(&channelmanager::provided_channel_type_features(&config)));
+
 		let feerate = fee_estimator.bounded_sat_per_1000_weight(ConfirmationTarget::Normal);
 
 		let value_to_self_msat = channel_value_satoshis * 1000 - push_msat;
-		let commitment_tx_fee = Self::commit_tx_fee_msat(feerate, MIN_AFFORDABLE_HTLC_COUNT, opt_anchors);
+		let commitment_tx_fee = Self::commit_tx_fee_msat(feerate, MIN_AFFORDABLE_HTLC_COUNT, channel_type.requires_anchors_zero_fee_htlc_tx());
 		if value_to_self_msat < commitment_tx_fee {
 			return Err(APIError::APIMisuseError{ err: format!("Funding amount ({}) can't even pay fee for initial commitment transaction fee of {}.", value_to_self_msat / 1000, commitment_tx_fee / 1000) });
 		}
 
 		let mut secp_ctx = Secp256k1::new();
-		secp_ctx.seeded_randomize(&keys_provider.get_secure_random_bytes());
+		secp_ctx.seeded_randomize(&entropy_source.get_secure_random_bytes());
 
 		let shutdown_scriptpubkey = if config.channel_handshake_config.commit_upfront_shutdown_pubkey {
-			Some(keys_provider.get_shutdown_scriptpubkey())
+			Some(signer_provider.get_shutdown_scriptpubkey())
 		} else { None };
 
 		if let Some(shutdown_scriptpubkey) = &shutdown_scriptpubkey {
@@ -972,7 +1004,7 @@ impl<Signer: Sign> Channel<Signer> {
 
 			inbound_handshake_limits_override: Some(config.channel_handshake_limits.clone()),
 
-			channel_id: keys_provider.get_secure_random_bytes(),
+			channel_id: entropy_source.get_secure_random_bytes(),
 			channel_state: ChannelState::OurInitSent as u32,
 			announcement_sigs_state: AnnouncementSigsState::NotSent,
 			secp_ctx,
@@ -982,7 +1014,7 @@ impl<Signer: Sign> Channel<Signer> {
 
 			holder_signer,
 			shutdown_scriptpubkey,
-			destination_script: keys_provider.get_destination_script(),
+			destination_script: signer_provider.get_destination_script(),
 
 			cur_holder_commitment_transaction_number: INITIAL_COMMITMENT_NUMBER,
 			cur_counterparty_commitment_transaction_number: INITIAL_COMMITMENT_NUMBER,
@@ -1043,7 +1075,7 @@ impl<Signer: Sign> Channel<Signer> {
 				is_outbound_from_holder: true,
 				counterparty_parameters: None,
 				funding_outpoint: None,
-				opt_anchors: if opt_anchors { Some(()) } else { None },
+				opt_anchors: if channel_type.requires_anchors_zero_fee_htlc_tx() { Some(()) } else { None },
 				opt_non_zero_fee_anchors: None
 			},
 			funding_transaction: None,
@@ -1076,8 +1108,10 @@ impl<Signer: Sign> Channel<Signer> {
 			#[cfg(any(test, fuzzing))]
 			historical_inbound_htlc_fulfills: HashSet::new(),
 
-			channel_type: Self::get_initial_channel_type(&config),
+			channel_type,
 			channel_keys_id,
+
+			pending_monitor_updates: Vec::new(),
 		})
 	}
 
@@ -1115,16 +1149,17 @@ impl<Signer: Sign> Channel<Signer> {
 
 	/// Creates a new channel from a remote sides' request for one.
 	/// Assumes chain_hash has already been checked and corresponds with what we expect!
-	pub fn new_from_req<K: Deref, F: Deref, L: Deref>(
-		fee_estimator: &LowerBoundedFeeEstimator<F>, keys_provider: &K, counterparty_node_id: PublicKey, their_features: &InitFeatures,
-		msg: &msgs::OpenChannel, user_id: u128, config: &UserConfig, current_chain_height: u32, logger: &L,
-		outbound_scid_alias: u64
+	pub fn new_from_req<ES: Deref, SP: Deref, F: Deref, L: Deref>(
+		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP,
+		counterparty_node_id: PublicKey, our_supported_features: &ChannelTypeFeatures,
+		their_features: &InitFeatures, msg: &msgs::OpenChannel, user_id: u128, config: &UserConfig,
+		current_chain_height: u32, logger: &L, outbound_scid_alias: u64
 	) -> Result<Channel<Signer>, ChannelError>
-		where K::Target: KeysInterface<Signer = Signer>,
-		      F::Target: FeeEstimator,
-		      L::Target: Logger,
+		where ES::Target: EntropySource,
+			  SP::Target: SignerProvider<Signer = Signer>,
+			  F::Target: FeeEstimator,
+			  L::Target: Logger,
 	{
-		let opt_anchors = false; // TODO - should be based on features
 		let announced_channel = if (msg.channel_flags & 1) == 1 { true } else { false };
 
 		// First check the channel type is known, failing before we do anything else if we don't
@@ -1134,34 +1169,31 @@ impl<Signer: Sign> Channel<Signer> {
 				return Err(ChannelError::Close("Channel Type field contained optional bits - this is not allowed".to_owned()));
 			}
 
-			if channel_type.requires_unknown_bits() {
-				return Err(ChannelError::Close("Channel Type field contains unknown bits".to_owned()));
+			// We only support the channel types defined by the `ChannelManager` in
+			// `provided_channel_type_features`. The channel type must always support
+			// `static_remote_key`.
+			if !channel_type.requires_static_remote_key() {
+				return Err(ChannelError::Close("Channel Type was not understood - we require static remote key".to_owned()));
 			}
-
-			// We currently only allow four channel types, so write it all out here - we allow
-			// `only_static_remote_key` or `static_remote_key | zero_conf` in all contexts, and
-			// further allow `static_remote_key | scid_privacy` or
-			// `static_remote_key | scid_privacy | zero_conf`, if the channel is not
-			// publicly announced.
-			if *channel_type != ChannelTypeFeatures::only_static_remote_key() {
-				if !channel_type.requires_scid_privacy() && !channel_type.requires_zero_conf() {
-					return Err(ChannelError::Close("Channel Type was not understood".to_owned()));
-				}
-
-				if channel_type.requires_scid_privacy() && announced_channel {
-					return Err(ChannelError::Close("SCID Alias/Privacy Channel Type cannot be set on a public channel".to_owned()));
-				}
+			// Make sure we support all of the features behind the channel type.
+			if !channel_type.is_subset(our_supported_features) {
+				return Err(ChannelError::Close("Channel Type contains unsupported features".to_owned()));
+			}
+			if channel_type.requires_scid_privacy() && announced_channel {
+				return Err(ChannelError::Close("SCID Alias/Privacy Channel Type cannot be set on a public channel".to_owned()));
 			}
 			channel_type.clone()
 		} else {
-			ChannelTypeFeatures::from_counterparty_init(&their_features)
+			let channel_type = ChannelTypeFeatures::from_init(&their_features);
+			if channel_type != ChannelTypeFeatures::only_static_remote_key() {
+				return Err(ChannelError::Close("Only static_remote_key is supported for non-negotiated channel types".to_owned()));
+			}
+			channel_type
 		};
-		if !channel_type.supports_static_remote_key() {
-			return Err(ChannelError::Close("Channel Type was not understood - we require static remote key".to_owned()));
-		}
+		let opt_anchors = channel_type.supports_anchors_zero_fee_htlc_tx();
 
-		let channel_keys_id = keys_provider.generate_channel_keys_id(true, msg.funding_satoshis, user_id);
-		let holder_signer = keys_provider.derive_channel_signer(msg.funding_satoshis, channel_keys_id);
+		let channel_keys_id = signer_provider.generate_channel_keys_id(true, msg.funding_satoshis, user_id);
+		let holder_signer = signer_provider.derive_channel_signer(msg.funding_satoshis, channel_keys_id);
 		let pubkeys = holder_signer.pubkeys().clone();
 		let counterparty_pubkeys = ChannelPublicKeys {
 			funding_pubkey: msg.funding_pubkey,
@@ -1292,7 +1324,7 @@ impl<Signer: Sign> Channel<Signer> {
 		} else { None };
 
 		let shutdown_scriptpubkey = if config.channel_handshake_config.commit_upfront_shutdown_pubkey {
-			Some(keys_provider.get_shutdown_scriptpubkey())
+			Some(signer_provider.get_shutdown_scriptpubkey())
 		} else { None };
 
 		if let Some(shutdown_scriptpubkey) = &shutdown_scriptpubkey {
@@ -1302,7 +1334,7 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 
 		let mut secp_ctx = Secp256k1::new();
-		secp_ctx.seeded_randomize(&keys_provider.get_secure_random_bytes());
+		secp_ctx.seeded_randomize(&entropy_source.get_secure_random_bytes());
 
 		let chan = Channel {
 			user_id,
@@ -1326,7 +1358,7 @@ impl<Signer: Sign> Channel<Signer> {
 
 			holder_signer,
 			shutdown_scriptpubkey,
-			destination_script: keys_provider.get_destination_script(),
+			destination_script: signer_provider.get_destination_script(),
 
 			cur_holder_commitment_transaction_number: INITIAL_COMMITMENT_NUMBER,
 			cur_counterparty_commitment_transaction_number: INITIAL_COMMITMENT_NUMBER,
@@ -1426,6 +1458,8 @@ impl<Signer: Sign> Channel<Signer> {
 
 			channel_type,
 			channel_keys_id,
+
+			pending_monitor_updates: Vec::new(),
 		};
 
 		Ok(chan)
@@ -1932,22 +1966,30 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 	}
 
-	pub fn get_update_fulfill_htlc_and_commit<L: Deref>(&mut self, htlc_id: u64, payment_preimage: PaymentPreimage, logger: &L) -> Result<UpdateFulfillCommitFetch, (ChannelError, ChannelMonitorUpdate)> where L::Target: Logger {
+	pub fn get_update_fulfill_htlc_and_commit<L: Deref>(&mut self, htlc_id: u64, payment_preimage: PaymentPreimage, logger: &L) -> UpdateFulfillCommitFetch where L::Target: Logger {
 		match self.get_update_fulfill_htlc(htlc_id, payment_preimage, logger) {
-			UpdateFulfillFetch::NewClaim { mut monitor_update, htlc_value_msat, msg: Some(update_fulfill_htlc) } => {
-				let (commitment, mut additional_update) = match self.send_commitment_no_status_check(logger) {
-					Err(e) => return Err((e, monitor_update)),
-					Ok(res) => res
-				};
-				// send_commitment_no_status_check may bump latest_monitor_id but we want them to be
+			UpdateFulfillFetch::NewClaim { mut monitor_update, htlc_value_msat, msg: Some(_) } => {
+				let mut additional_update = self.build_commitment_no_status_check(logger);
+				// build_commitment_no_status_check may bump latest_monitor_id but we want them to be
 				// strictly increasing by one, so decrement it here.
 				self.latest_monitor_update_id = monitor_update.update_id;
 				monitor_update.updates.append(&mut additional_update.updates);
-				Ok(UpdateFulfillCommitFetch::NewClaim { monitor_update, htlc_value_msat, msgs: Some((update_fulfill_htlc, commitment)) })
+				self.monitor_updating_paused(false, true, false, Vec::new(), Vec::new(), Vec::new());
+				self.pending_monitor_updates.push(monitor_update);
+				UpdateFulfillCommitFetch::NewClaim {
+					monitor_update: self.pending_monitor_updates.last().unwrap(),
+					htlc_value_msat,
+				}
 			},
-			UpdateFulfillFetch::NewClaim { monitor_update, htlc_value_msat, msg: None } =>
-				Ok(UpdateFulfillCommitFetch::NewClaim { monitor_update, htlc_value_msat, msgs: None }),
-			UpdateFulfillFetch::DuplicateClaim {} => Ok(UpdateFulfillCommitFetch::DuplicateClaim {}),
+			UpdateFulfillFetch::NewClaim { monitor_update, htlc_value_msat, msg: None } => {
+				self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new());
+				self.pending_monitor_updates.push(monitor_update);
+				UpdateFulfillCommitFetch::NewClaim {
+					monitor_update: self.pending_monitor_updates.last().unwrap(),
+					htlc_value_msat,
+				}
+			}
+			UpdateFulfillFetch::DuplicateClaim {} => UpdateFulfillCommitFetch::DuplicateClaim {},
 		}
 	}
 
@@ -2128,7 +2170,11 @@ impl<Signer: Sign> Channel<Signer> {
 		} else if their_features.supports_channel_type() {
 			// Assume they've accepted the channel type as they said they understand it.
 		} else {
-			self.channel_type = ChannelTypeFeatures::from_counterparty_init(&their_features)
+			let channel_type = ChannelTypeFeatures::from_init(&their_features);
+			if channel_type != ChannelTypeFeatures::only_static_remote_key() {
+				return Err(ChannelError::Close("Only static_remote_key is supported for non-negotiated channel types".to_owned()));
+			}
+			self.channel_type = channel_type;
 		}
 
 		let counterparty_shutdown_scriptpubkey = if their_features.supports_upfront_shutdown_script() {
@@ -2221,11 +2267,11 @@ impl<Signer: Sign> Channel<Signer> {
 		&self.get_counterparty_pubkeys().funding_pubkey
 	}
 
-	pub fn funding_created<K: Deref, L: Deref>(
-		&mut self, msg: &msgs::FundingCreated, best_block: BestBlock, keys_source: &K, logger: &L
-	) -> Result<(msgs::FundingSigned, ChannelMonitor<<K::Target as KeysInterface>::Signer>, Option<msgs::ChannelReady>), ChannelError>
+	pub fn funding_created<SP: Deref, L: Deref>(
+		&mut self, msg: &msgs::FundingCreated, best_block: BestBlock, signer_provider: &SP, logger: &L
+	) -> Result<(msgs::FundingSigned, ChannelMonitor<Signer>), ChannelError>
 	where
-		K::Target: KeysInterface,
+		SP::Target: SignerProvider<Signer = Signer>,
 		L::Target: Logger
 	{
 		if self.is_outbound() {
@@ -2282,7 +2328,7 @@ impl<Signer: Sign> Channel<Signer> {
 		let funding_txo_script = funding_redeemscript.to_v0_p2wsh();
 		let obscure_factor = get_commitment_transaction_number_obscure_factor(&self.get_holder_pubkeys().payment_point, &self.get_counterparty_pubkeys().payment_point, self.is_outbound());
 		let shutdown_script = self.shutdown_scriptpubkey.clone().map(|script| script.into_inner());
-		let mut monitor_signer = keys_source.derive_channel_signer(self.channel_value_satoshis, self.channel_keys_id);
+		let mut monitor_signer = signer_provider.derive_channel_signer(self.channel_value_satoshis, self.channel_keys_id);
 		monitor_signer.provide_channel_parameters(&self.channel_transaction_parameters);
 		let channel_monitor = ChannelMonitor::new(self.secp_ctx.clone(), monitor_signer,
 		                                          shutdown_script, self.get_holder_selected_contest_delay(),
@@ -2301,19 +2347,22 @@ impl<Signer: Sign> Channel<Signer> {
 
 		log_info!(logger, "Generated funding_signed for peer for channel {}", log_bytes!(self.channel_id()));
 
+		let need_channel_ready = self.check_get_channel_ready(0).is_some();
+		self.monitor_updating_paused(false, false, need_channel_ready, Vec::new(), Vec::new(), Vec::new());
+
 		Ok((msgs::FundingSigned {
 			channel_id: self.channel_id,
 			signature
-		}, channel_monitor, self.check_get_channel_ready(0)))
+		}, channel_monitor))
 	}
 
 	/// Handles a funding_signed message from the remote end.
 	/// If this call is successful, broadcast the funding transaction (and not before!)
-	pub fn funding_signed<K: Deref, L: Deref>(
-		&mut self, msg: &msgs::FundingSigned, best_block: BestBlock, keys_source: &K, logger: &L
-	) -> Result<(ChannelMonitor<<K::Target as KeysInterface>::Signer>, Transaction, Option<msgs::ChannelReady>), ChannelError>
+	pub fn funding_signed<SP: Deref, L: Deref>(
+		&mut self, msg: &msgs::FundingSigned, best_block: BestBlock, signer_provider: &SP, logger: &L
+	) -> Result<ChannelMonitor<Signer>, ChannelError>
 	where
-		K::Target: KeysInterface,
+		SP::Target: SignerProvider<Signer = Signer>,
 		L::Target: Logger
 	{
 		if !self.is_outbound() {
@@ -2367,7 +2416,7 @@ impl<Signer: Sign> Channel<Signer> {
 		let funding_txo_script = funding_redeemscript.to_v0_p2wsh();
 		let obscure_factor = get_commitment_transaction_number_obscure_factor(&self.get_holder_pubkeys().payment_point, &self.get_counterparty_pubkeys().payment_point, self.is_outbound());
 		let shutdown_script = self.shutdown_scriptpubkey.clone().map(|script| script.into_inner());
-		let mut monitor_signer = keys_source.derive_channel_signer(self.channel_value_satoshis, self.channel_keys_id);
+		let mut monitor_signer = signer_provider.derive_channel_signer(self.channel_value_satoshis, self.channel_keys_id);
 		monitor_signer.provide_channel_parameters(&self.channel_transaction_parameters);
 		let channel_monitor = ChannelMonitor::new(self.secp_ctx.clone(), monitor_signer,
 		                                          shutdown_script, self.get_holder_selected_contest_delay(),
@@ -2386,13 +2435,22 @@ impl<Signer: Sign> Channel<Signer> {
 
 		log_info!(logger, "Received funding_signed from peer for channel {}", log_bytes!(self.channel_id()));
 
-		Ok((channel_monitor, self.funding_transaction.as_ref().cloned().unwrap(), self.check_get_channel_ready(0)))
+		let need_channel_ready = self.check_get_channel_ready(0).is_some();
+		self.monitor_updating_paused(false, false, need_channel_ready, Vec::new(), Vec::new(), Vec::new());
+		Ok(channel_monitor)
 	}
 
 	/// Handles a channel_ready message from our peer. If we've already sent our channel_ready
 	/// and the channel is now usable (and public), this may generate an announcement_signatures to
 	/// reply with.
-	pub fn channel_ready<L: Deref>(&mut self, msg: &msgs::ChannelReady, node_pk: PublicKey, genesis_block_hash: BlockHash, best_block: &BestBlock, logger: &L) -> Result<Option<msgs::AnnouncementSignatures>, ChannelError> where L::Target: Logger {
+	pub fn channel_ready<NS: Deref, L: Deref>(
+		&mut self, msg: &msgs::ChannelReady, node_signer: &NS, genesis_block_hash: BlockHash,
+		user_config: &UserConfig, best_block: &BestBlock, logger: &L
+	) -> Result<Option<msgs::AnnouncementSignatures>, ChannelError>
+	where
+		NS::Target: NodeSigner,
+		L::Target: Logger
+	{
 		if self.channel_state & (ChannelState::PeerDisconnected as u32) == ChannelState::PeerDisconnected as u32 {
 			self.workaround_lnd_bug_4006 = Some(msg.clone());
 			return Err(ChannelError::Ignore("Peer sent channel_ready when we needed a channel_reestablish. The peer is likely lnd, see https://github.com/lightningnetwork/lnd/issues/4006".to_owned()));
@@ -2426,6 +2484,11 @@ impl<Signer: Sign> Channel<Signer> {
 					// If they haven't ever sent an updated point, the point they send should match
 					// the current one.
 					self.counterparty_cur_commitment_point
+				} else if self.cur_counterparty_commitment_transaction_number == INITIAL_COMMITMENT_NUMBER - 2 {
+					// If we've advanced the commitment number once, the second commitment point is
+					// at `counterparty_prev_commitment_point`, which is not yet revoked.
+					debug_assert!(self.counterparty_prev_commitment_point.is_some());
+					self.counterparty_prev_commitment_point
 				} else {
 					// If they have sent updated points, channel_ready is always supposed to match
 					// their "first" point, which we re-derive here.
@@ -2446,7 +2509,7 @@ impl<Signer: Sign> Channel<Signer> {
 
 		log_info!(logger, "Received channel_ready from peer for channel {}", log_bytes!(self.channel_id()));
 
-		Ok(self.get_announcement_sigs(node_pk, genesis_block_hash, best_block.height(), logger))
+		Ok(self.get_announcement_sigs(node_signer, genesis_block_hash, user_config, best_block.height(), logger))
 	}
 
 	/// Returns transaction if there is pending funding transaction that is yet to broadcast
@@ -2991,17 +3054,17 @@ impl<Signer: Sign> Channel<Signer> {
 		Ok(())
 	}
 
-	pub fn commitment_signed<L: Deref>(&mut self, msg: &msgs::CommitmentSigned, logger: &L) -> Result<(msgs::RevokeAndACK, Option<msgs::CommitmentSigned>, ChannelMonitorUpdate), (Option<ChannelMonitorUpdate>, ChannelError)>
+	pub fn commitment_signed<L: Deref>(&mut self, msg: &msgs::CommitmentSigned, logger: &L) -> Result<&ChannelMonitorUpdate, ChannelError>
 		where L::Target: Logger
 	{
 		if (self.channel_state & (ChannelState::ChannelReady as u32)) != (ChannelState::ChannelReady as u32) {
-			return Err((None, ChannelError::Close("Got commitment signed message when channel was not in an operational state".to_owned())));
+			return Err(ChannelError::Close("Got commitment signed message when channel was not in an operational state".to_owned()));
 		}
 		if self.channel_state & (ChannelState::PeerDisconnected as u32) == ChannelState::PeerDisconnected as u32 {
-			return Err((None, ChannelError::Close("Peer sent commitment_signed when we needed a channel_reestablish".to_owned())));
+			return Err(ChannelError::Close("Peer sent commitment_signed when we needed a channel_reestablish".to_owned()));
 		}
 		if self.channel_state & BOTH_SIDES_SHUTDOWN_MASK == BOTH_SIDES_SHUTDOWN_MASK && self.last_sent_closing_fee.is_some() {
-			return Err((None, ChannelError::Close("Peer sent commitment_signed after we'd started exchanging closing_signeds".to_owned())));
+			return Err(ChannelError::Close("Peer sent commitment_signed after we'd started exchanging closing_signeds".to_owned()));
 		}
 
 		let funding_script = self.get_funding_redeemscript();
@@ -3019,7 +3082,7 @@ impl<Signer: Sign> Channel<Signer> {
 				log_bytes!(self.counterparty_funding_pubkey().serialize()), encode::serialize_hex(&bitcoin_tx.transaction),
 				log_bytes!(sighash[..]), encode::serialize_hex(&funding_script), log_bytes!(self.channel_id()));
 			if let Err(_) = self.secp_ctx.verify_ecdsa(&sighash, &msg.signature, &self.counterparty_funding_pubkey()) {
-				return Err((None, ChannelError::Close("Invalid commitment tx signature from peer".to_owned())));
+				return Err(ChannelError::Close("Invalid commitment tx signature from peer".to_owned()));
 			}
 			bitcoin_tx.txid
 		};
@@ -3034,7 +3097,7 @@ impl<Signer: Sign> Channel<Signer> {
 			debug_assert!(!self.is_outbound());
 			let counterparty_reserve_we_require_msat = self.holder_selected_channel_reserve_satoshis * 1000;
 			if commitment_stats.remote_balance_msat < commitment_stats.total_fee_sat * 1000 + counterparty_reserve_we_require_msat {
-				return Err((None, ChannelError::Close("Funding remote cannot afford proposed new fee".to_owned())));
+				return Err(ChannelError::Close("Funding remote cannot afford proposed new fee".to_owned()));
 			}
 		}
 		#[cfg(any(test, fuzzing))]
@@ -3056,7 +3119,7 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 
 		if msg.htlc_signatures.len() != commitment_stats.num_nondust_htlcs {
-			return Err((None, ChannelError::Close(format!("Got wrong number of HTLC signatures ({}) from remote. It must be {}", msg.htlc_signatures.len(), commitment_stats.num_nondust_htlcs))));
+			return Err(ChannelError::Close(format!("Got wrong number of HTLC signatures ({}) from remote. It must be {}", msg.htlc_signatures.len(), commitment_stats.num_nondust_htlcs)));
 		}
 
 		// TODO: Sadly, we pass HTLCs twice to ChannelMonitor: once via the HolderCommitmentTransaction and once via the update
@@ -3074,7 +3137,7 @@ impl<Signer: Sign> Channel<Signer> {
 					log_bytes!(msg.htlc_signatures[idx].serialize_compact()[..]), log_bytes!(keys.countersignatory_htlc_key.serialize()),
 					encode::serialize_hex(&htlc_tx), log_bytes!(htlc_sighash[..]), encode::serialize_hex(&htlc_redeemscript), log_bytes!(self.channel_id()));
 				if let Err(_) = self.secp_ctx.verify_ecdsa(&htlc_sighash, &msg.htlc_signatures[idx], &keys.countersignatory_htlc_key) {
-					return Err((None, ChannelError::Close("Invalid HTLC tx signature from peer".to_owned())));
+					return Err(ChannelError::Close("Invalid HTLC tx signature from peer".to_owned()));
 				}
 				htlcs_and_sigs.push((htlc, Some(msg.htlc_signatures[idx]), source));
 			} else {
@@ -3090,10 +3153,8 @@ impl<Signer: Sign> Channel<Signer> {
 			self.counterparty_funding_pubkey()
 		);
 
-		let next_per_commitment_point = self.holder_signer.get_per_commitment_point(self.cur_holder_commitment_transaction_number - 1, &self.secp_ctx);
 		self.holder_signer.validate_holder_commitment(&holder_commitment_tx, commitment_stats.preimages)
-			.map_err(|_| (None, ChannelError::Close("Failed to validate our commitment".to_owned())))?;
-		let per_commitment_secret = self.holder_signer.release_commitment_secret(self.cur_holder_commitment_transaction_number + 1);
+			.map_err(|_| ChannelError::Close("Failed to validate our commitment".to_owned()))?;
 
 		// Update state now that we've passed all the can-fail calls...
 		let mut need_commitment = false;
@@ -3103,15 +3164,6 @@ impl<Signer: Sign> Channel<Signer> {
 				need_commitment = true;
 			}
 		}
-
-		self.latest_monitor_update_id += 1;
-		let mut monitor_update = ChannelMonitorUpdate {
-			update_id: self.latest_monitor_update_id,
-			updates: vec![ChannelMonitorUpdateStep::LatestHolderCommitmentTXInfo {
-				commitment_tx: holder_commitment_tx,
-				htlc_outputs: htlcs_and_sigs
-			}]
-		};
 
 		for htlc in self.pending_inbound_htlcs.iter_mut() {
 			let new_forward = if let &InboundHTLCState::RemoteAnnounced(ref forward_info) = &htlc.state {
@@ -3124,6 +3176,7 @@ impl<Signer: Sign> Channel<Signer> {
 				need_commitment = true;
 			}
 		}
+		let mut claimed_htlcs = Vec::new();
 		for htlc in self.pending_outbound_htlcs.iter_mut() {
 			if let &mut OutboundHTLCState::RemoteRemoved(ref mut outcome) = &mut htlc.state {
 				log_trace!(logger, "Updating HTLC {} to AwaitingRemoteRevokeToRemove due to commitment_signed in channel {}.",
@@ -3131,14 +3184,33 @@ impl<Signer: Sign> Channel<Signer> {
 				// Grab the preimage, if it exists, instead of cloning
 				let mut reason = OutboundHTLCOutcome::Success(None);
 				mem::swap(outcome, &mut reason);
+				if let OutboundHTLCOutcome::Success(Some(preimage)) = reason {
+					// If a user (a) receives an HTLC claim using LDK 0.0.104 or before, then (b)
+					// upgrades to LDK 0.0.114 or later before the HTLC is fully resolved, we could
+					// have a `Success(None)` reason. In this case we could forget some HTLC
+					// claims, but such an upgrade is unlikely and including claimed HTLCs here
+					// fixes a bug which the user was exposed to on 0.0.104 when they started the
+					// claim anyway.
+					claimed_htlcs.push((SentHTLCId::from_source(&htlc.source), preimage));
+				}
 				htlc.state = OutboundHTLCState::AwaitingRemoteRevokeToRemove(reason);
 				need_commitment = true;
 			}
 		}
 
+		self.latest_monitor_update_id += 1;
+		let mut monitor_update = ChannelMonitorUpdate {
+			update_id: self.latest_monitor_update_id,
+			updates: vec![ChannelMonitorUpdateStep::LatestHolderCommitmentTXInfo {
+				commitment_tx: holder_commitment_tx,
+				htlc_outputs: htlcs_and_sigs,
+				claimed_htlcs,
+			}]
+		};
+
 		self.cur_holder_commitment_transaction_number -= 1;
 		// Note that if we need_commitment & !AwaitingRemoteRevoke we'll call
-		// send_commitment_no_status_check() next which will reset this to RAAFirst.
+		// build_commitment_no_status_check() next which will reset this to RAAFirst.
 		self.resend_order = RAACommitmentOrder::CommitmentFirst;
 
 		if (self.channel_state & ChannelState::MonitorUpdateInProgress as u32) != 0 {
@@ -3150,52 +3222,50 @@ impl<Signer: Sign> Channel<Signer> {
 				// the corresponding HTLC status updates so that get_last_commitment_update
 				// includes the right HTLCs.
 				self.monitor_pending_commitment_signed = true;
-				let (_, mut additional_update) = self.send_commitment_no_status_check(logger).map_err(|e| (None, e))?;
-				// send_commitment_no_status_check may bump latest_monitor_id but we want them to be
+				let mut additional_update = self.build_commitment_no_status_check(logger);
+				// build_commitment_no_status_check may bump latest_monitor_id but we want them to be
 				// strictly increasing by one, so decrement it here.
 				self.latest_monitor_update_id = monitor_update.update_id;
 				monitor_update.updates.append(&mut additional_update.updates);
 			}
 			log_debug!(logger, "Received valid commitment_signed from peer in channel {}, updated HTLC state but awaiting a monitor update resolution to reply.",
 				log_bytes!(self.channel_id));
-			return Err((Some(monitor_update), ChannelError::Ignore("Previous monitor update failure prevented generation of RAA".to_owned())));
+			self.pending_monitor_updates.push(monitor_update);
+			return Ok(self.pending_monitor_updates.last().unwrap());
 		}
 
-		let commitment_signed = if need_commitment && (self.channel_state & (ChannelState::AwaitingRemoteRevoke as u32)) == 0 {
+		let need_commitment_signed = if need_commitment && (self.channel_state & (ChannelState::AwaitingRemoteRevoke as u32)) == 0 {
 			// If we're AwaitingRemoteRevoke we can't send a new commitment here, but that's ok -
 			// we'll send one right away when we get the revoke_and_ack when we
 			// free_holding_cell_htlcs().
-			let (msg, mut additional_update) = self.send_commitment_no_status_check(logger).map_err(|e| (None, e))?;
-			// send_commitment_no_status_check may bump latest_monitor_id but we want them to be
+			let mut additional_update = self.build_commitment_no_status_check(logger);
+			// build_commitment_no_status_check may bump latest_monitor_id but we want them to be
 			// strictly increasing by one, so decrement it here.
 			self.latest_monitor_update_id = monitor_update.update_id;
 			monitor_update.updates.append(&mut additional_update.updates);
-			Some(msg)
-		} else { None };
+			true
+		} else { false };
 
 		log_debug!(logger, "Received valid commitment_signed from peer in channel {}, updating HTLC state and responding with{} a revoke_and_ack.",
-			log_bytes!(self.channel_id()), if commitment_signed.is_some() { " our own commitment_signed and" } else { "" });
-
-		Ok((msgs::RevokeAndACK {
-			channel_id: self.channel_id,
-			per_commitment_secret,
-			next_per_commitment_point,
-		}, commitment_signed, monitor_update))
+			log_bytes!(self.channel_id()), if need_commitment_signed { " our own commitment_signed and" } else { "" });
+		self.pending_monitor_updates.push(monitor_update);
+		self.monitor_updating_paused(true, need_commitment_signed, false, Vec::new(), Vec::new(), Vec::new());
+		return Ok(self.pending_monitor_updates.last().unwrap());
 	}
 
 	/// Public version of the below, checking relevant preconditions first.
 	/// If we're not in a state where freeing the holding cell makes sense, this is a no-op and
 	/// returns `(None, Vec::new())`.
-	pub fn maybe_free_holding_cell_htlcs<L: Deref>(&mut self, logger: &L) -> Result<(Option<(msgs::CommitmentUpdate, ChannelMonitorUpdate)>, Vec<(HTLCSource, PaymentHash)>), ChannelError> where L::Target: Logger {
+	pub fn maybe_free_holding_cell_htlcs<L: Deref>(&mut self, logger: &L) -> (Option<&ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>) where L::Target: Logger {
 		if self.channel_state >= ChannelState::ChannelReady as u32 &&
 		   (self.channel_state & (ChannelState::AwaitingRemoteRevoke as u32 | ChannelState::PeerDisconnected as u32 | ChannelState::MonitorUpdateInProgress as u32)) == 0 {
 			self.free_holding_cell_htlcs(logger)
-		} else { Ok((None, Vec::new())) }
+		} else { (None, Vec::new()) }
 	}
 
 	/// Frees any pending commitment updates in the holding cell, generating the relevant messages
 	/// for our counterparty.
-	fn free_holding_cell_htlcs<L: Deref>(&mut self, logger: &L) -> Result<(Option<(msgs::CommitmentUpdate, ChannelMonitorUpdate)>, Vec<(HTLCSource, PaymentHash)>), ChannelError> where L::Target: Logger {
+	fn free_holding_cell_htlcs<L: Deref>(&mut self, logger: &L) -> (Option<&ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>) where L::Target: Logger {
 		assert_eq!(self.channel_state & ChannelState::MonitorUpdateInProgress as u32, 0);
 		if self.holding_cell_htlc_updates.len() != 0 || self.holding_cell_update_fee.is_some() {
 			log_trace!(logger, "Freeing holding cell with {} HTLC updates{} in channel {}", self.holding_cell_htlc_updates.len(),
@@ -3276,7 +3346,7 @@ impl<Signer: Sign> Channel<Signer> {
 				}
 			}
 			if update_add_htlcs.is_empty() && update_fulfill_htlcs.is_empty() && update_fail_htlcs.is_empty() && self.holding_cell_update_fee.is_none() {
-				return Ok((None, htlcs_to_fail));
+				return (None, htlcs_to_fail);
 			}
 			let update_fee = if let Some(feerate) = self.holding_cell_update_fee.take() {
 				self.send_update_fee(feerate, false, logger)
@@ -3284,8 +3354,8 @@ impl<Signer: Sign> Channel<Signer> {
 				None
 			};
 
-			let (commitment_signed, mut additional_update) = self.send_commitment_no_status_check(logger)?;
-			// send_commitment_no_status_check and get_update_fulfill_htlc may bump latest_monitor_id
+			let mut additional_update = self.build_commitment_no_status_check(logger);
+			// build_commitment_no_status_check and get_update_fulfill_htlc may bump latest_monitor_id
 			// but we want them to be strictly increasing by one, so reset it here.
 			self.latest_monitor_update_id = monitor_update.update_id;
 			monitor_update.updates.append(&mut additional_update.updates);
@@ -3294,16 +3364,11 @@ impl<Signer: Sign> Channel<Signer> {
 				log_bytes!(self.channel_id()), if update_fee.is_some() { "a fee update, " } else { "" },
 				update_add_htlcs.len(), update_fulfill_htlcs.len(), update_fail_htlcs.len());
 
-			Ok((Some((msgs::CommitmentUpdate {
-				update_add_htlcs,
-				update_fulfill_htlcs,
-				update_fail_htlcs,
-				update_fail_malformed_htlcs: Vec::new(),
-				update_fee,
-				commitment_signed,
-			}, monitor_update)), htlcs_to_fail))
+			self.monitor_updating_paused(false, true, false, Vec::new(), Vec::new(), Vec::new());
+			self.pending_monitor_updates.push(monitor_update);
+			(Some(self.pending_monitor_updates.last().unwrap()), htlcs_to_fail)
 		} else {
-			Ok((None, Vec::new()))
+			(None, Vec::new())
 		}
 	}
 
@@ -3312,7 +3377,7 @@ impl<Signer: Sign> Channel<Signer> {
 	/// waiting on this revoke_and_ack. The generation of this new commitment_signed may also fail,
 	/// generating an appropriate error *after* the channel state has been updated based on the
 	/// revoke_and_ack message.
-	pub fn revoke_and_ack<L: Deref>(&mut self, msg: &msgs::RevokeAndACK, logger: &L) -> Result<RAAUpdates, ChannelError>
+	pub fn revoke_and_ack<L: Deref>(&mut self, msg: &msgs::RevokeAndACK, logger: &L) -> Result<(Vec<(HTLCSource, PaymentHash)>, &ChannelMonitorUpdate), ChannelError>
 		where L::Target: Logger,
 	{
 		if (self.channel_state & (ChannelState::ChannelReady as u32)) != (ChannelState::ChannelReady as u32) {
@@ -3499,8 +3564,8 @@ impl<Signer: Sign> Channel<Signer> {
 				// When the monitor updating is restored we'll call get_last_commitment_update(),
 				// which does not update state, but we're definitely now awaiting a remote revoke
 				// before we can step forward any more, so set it here.
-				let (_, mut additional_update) = self.send_commitment_no_status_check(logger)?;
-				// send_commitment_no_status_check may bump latest_monitor_id but we want them to be
+				let mut additional_update = self.build_commitment_no_status_check(logger);
+				// build_commitment_no_status_check may bump latest_monitor_id but we want them to be
 				// strictly increasing by one, so decrement it here.
 				self.latest_monitor_update_id = monitor_update.update_id;
 				monitor_update.updates.append(&mut additional_update.updates);
@@ -3509,71 +3574,41 @@ impl<Signer: Sign> Channel<Signer> {
 			self.monitor_pending_failures.append(&mut revoked_htlcs);
 			self.monitor_pending_finalized_fulfills.append(&mut finalized_claimed_htlcs);
 			log_debug!(logger, "Received a valid revoke_and_ack for channel {} but awaiting a monitor update resolution to reply.", log_bytes!(self.channel_id()));
-			return Ok(RAAUpdates {
-				commitment_update: None, finalized_claimed_htlcs: Vec::new(),
-				accepted_htlcs: Vec::new(), failed_htlcs: Vec::new(),
-				monitor_update,
-				holding_cell_failed_htlcs: Vec::new()
-			});
+			self.pending_monitor_updates.push(monitor_update);
+			return Ok((Vec::new(), self.pending_monitor_updates.last().unwrap()));
 		}
 
-		match self.free_holding_cell_htlcs(logger)? {
-			(Some((mut commitment_update, mut additional_update)), htlcs_to_fail) => {
-				commitment_update.update_fail_htlcs.reserve(update_fail_htlcs.len());
-				for fail_msg in update_fail_htlcs.drain(..) {
-					commitment_update.update_fail_htlcs.push(fail_msg);
-				}
-				commitment_update.update_fail_malformed_htlcs.reserve(update_fail_malformed_htlcs.len());
-				for fail_msg in update_fail_malformed_htlcs.drain(..) {
-					commitment_update.update_fail_malformed_htlcs.push(fail_msg);
-				}
-
+		match self.free_holding_cell_htlcs(logger) {
+			(Some(_), htlcs_to_fail) => {
+				let mut additional_update = self.pending_monitor_updates.pop().unwrap();
 				// free_holding_cell_htlcs may bump latest_monitor_id multiple times but we want them to be
 				// strictly increasing by one, so decrement it here.
 				self.latest_monitor_update_id = monitor_update.update_id;
 				monitor_update.updates.append(&mut additional_update.updates);
 
-				Ok(RAAUpdates {
-					commitment_update: Some(commitment_update),
-					finalized_claimed_htlcs,
-					accepted_htlcs: to_forward_infos,
-					failed_htlcs: revoked_htlcs,
-					monitor_update,
-					holding_cell_failed_htlcs: htlcs_to_fail
-				})
+				self.monitor_updating_paused(false, true, false, to_forward_infos, revoked_htlcs, finalized_claimed_htlcs);
+				self.pending_monitor_updates.push(monitor_update);
+				Ok((htlcs_to_fail, self.pending_monitor_updates.last().unwrap()))
 			},
 			(None, htlcs_to_fail) => {
 				if require_commitment {
-					let (commitment_signed, mut additional_update) = self.send_commitment_no_status_check(logger)?;
+					let mut additional_update = self.build_commitment_no_status_check(logger);
 
-					// send_commitment_no_status_check may bump latest_monitor_id but we want them to be
+					// build_commitment_no_status_check may bump latest_monitor_id but we want them to be
 					// strictly increasing by one, so decrement it here.
 					self.latest_monitor_update_id = monitor_update.update_id;
 					monitor_update.updates.append(&mut additional_update.updates);
 
 					log_debug!(logger, "Received a valid revoke_and_ack for channel {}. Responding with a commitment update with {} HTLCs failed.",
 						log_bytes!(self.channel_id()), update_fail_htlcs.len() + update_fail_malformed_htlcs.len());
-					Ok(RAAUpdates {
-						commitment_update: Some(msgs::CommitmentUpdate {
-							update_add_htlcs: Vec::new(),
-							update_fulfill_htlcs: Vec::new(),
-							update_fail_htlcs,
-							update_fail_malformed_htlcs,
-							update_fee: None,
-							commitment_signed
-						}),
-						finalized_claimed_htlcs,
-						accepted_htlcs: to_forward_infos, failed_htlcs: revoked_htlcs,
-						monitor_update, holding_cell_failed_htlcs: htlcs_to_fail
-					})
+					self.monitor_updating_paused(false, true, false, to_forward_infos, revoked_htlcs, finalized_claimed_htlcs);
+					self.pending_monitor_updates.push(monitor_update);
+					Ok((htlcs_to_fail, self.pending_monitor_updates.last().unwrap()))
 				} else {
 					log_debug!(logger, "Received a valid revoke_and_ack for channel {} with no reply necessary.", log_bytes!(self.channel_id()));
-					Ok(RAAUpdates {
-						commitment_update: None,
-						finalized_claimed_htlcs,
-						accepted_htlcs: to_forward_infos, failed_htlcs: revoked_htlcs,
-						monitor_update, holding_cell_failed_htlcs: htlcs_to_fail
-					})
+					self.monitor_updating_paused(false, false, false, to_forward_infos, revoked_htlcs, finalized_claimed_htlcs);
+					self.pending_monitor_updates.push(monitor_update);
+					Ok((htlcs_to_fail, self.pending_monitor_updates.last().unwrap()))
 				}
 			}
 		}
@@ -3725,15 +3760,17 @@ impl<Signer: Sign> Channel<Signer> {
 	}
 
 	/// Indicates that a ChannelMonitor update is in progress and has not yet been fully persisted.
-	/// This must be called immediately after the [`chain::Watch`] call which returned
-	/// [`ChannelMonitorUpdateStatus::InProgress`].
+	/// This must be called before we return the [`ChannelMonitorUpdate`] back to the
+	/// [`ChannelManager`], which will call [`Self::monitor_updating_restored`] once the monitor
+	/// update completes (potentially immediately).
 	/// The messages which were generated with the monitor update must *not* have been sent to the
 	/// remote end, and must instead have been dropped. They will be regenerated when
 	/// [`Self::monitor_updating_restored`] is called.
 	///
+	/// [`ChannelManager`]: super::channelmanager::ChannelManager
 	/// [`chain::Watch`]: crate::chain::Watch
 	/// [`ChannelMonitorUpdateStatus::InProgress`]: crate::chain::ChannelMonitorUpdateStatus::InProgress
-	pub fn monitor_updating_paused(&mut self, resend_raa: bool, resend_commitment: bool,
+	fn monitor_updating_paused(&mut self, resend_raa: bool, resend_commitment: bool,
 		resend_channel_ready: bool, mut pending_forwards: Vec<(PendingHTLCInfo, u64)>,
 		mut pending_fails: Vec<(HTLCSource, PaymentHash, HTLCFailReason)>,
 		mut pending_finalized_claimed_htlcs: Vec<HTLCSource>
@@ -3750,9 +3787,17 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Indicates that the latest ChannelMonitor update has been committed by the client
 	/// successfully and we should restore normal operation. Returns messages which should be sent
 	/// to the remote side.
-	pub fn monitor_updating_restored<L: Deref>(&mut self, logger: &L, node_pk: PublicKey, genesis_block_hash: BlockHash, best_block_height: u32) -> MonitorRestoreUpdates where L::Target: Logger {
+	pub fn monitor_updating_restored<L: Deref, NS: Deref>(
+		&mut self, logger: &L, node_signer: &NS, genesis_block_hash: BlockHash,
+		user_config: &UserConfig, best_block_height: u32
+	) -> MonitorRestoreUpdates
+	where
+		L::Target: Logger,
+		NS::Target: NodeSigner
+	{
 		assert_eq!(self.channel_state & ChannelState::MonitorUpdateInProgress as u32, ChannelState::MonitorUpdateInProgress as u32);
 		self.channel_state &= !(ChannelState::MonitorUpdateInProgress as u32);
+		self.pending_monitor_updates.clear();
 
 		// If we're past (or at) the FundingSent stage on an outbound channel, try to
 		// (re-)broadcast the funding transaction as we may have declined to broadcast it when we
@@ -3785,7 +3830,7 @@ impl<Signer: Sign> Channel<Signer> {
 			})
 		} else { None };
 
-		let announcement_sigs = self.get_announcement_sigs(node_pk, genesis_block_hash, best_block_height, logger);
+		let announcement_sigs = self.get_announcement_sigs(node_signer, genesis_block_hash, user_config, best_block_height, logger);
 
 		let mut accepted_htlcs = Vec::new();
 		mem::swap(&mut accepted_htlcs, &mut self.monitor_pending_forwards);
@@ -3937,9 +3982,14 @@ impl<Signer: Sign> Channel<Signer> {
 	/// `cargo doc --document-private-items`):
 	/// [`super::channelmanager::ChannelManager::force_close_without_broadcasting_txn`] and
 	/// [`super::channelmanager::ChannelManager::force_close_all_channels_without_broadcasting_txn`].
-	pub fn channel_reestablish<L: Deref>(&mut self, msg: &msgs::ChannelReestablish, logger: &L,
-		node_pk: PublicKey, genesis_block_hash: BlockHash, best_block: &BestBlock)
-	-> Result<ReestablishResponses, ChannelError> where L::Target: Logger {
+	pub fn channel_reestablish<L: Deref, NS: Deref>(
+		&mut self, msg: &msgs::ChannelReestablish, logger: &L, node_signer: &NS,
+		genesis_block_hash: BlockHash, user_config: &UserConfig, best_block: &BestBlock
+	) -> Result<ReestablishResponses, ChannelError>
+	where
+		L::Target: Logger,
+		NS::Target: NodeSigner
+	{
 		if self.channel_state & (ChannelState::PeerDisconnected as u32) == 0 {
 			// While BOLT 2 doesn't indicate explicitly we should error this channel here, it
 			// almost certainly indicates we are going to end up out-of-sync in some way, so we
@@ -4003,7 +4053,7 @@ impl<Signer: Sign> Channel<Signer> {
 			})
 		} else { None };
 
-		let announcement_sigs = self.get_announcement_sigs(node_pk, genesis_block_hash, best_block.height(), logger);
+		let announcement_sigs = self.get_announcement_sigs(node_signer, genesis_block_hash, user_config, best_block.height(), logger);
 
 		if self.channel_state & (ChannelState::FundingSent as u32) == ChannelState::FundingSent as u32 {
 			// If we're waiting on a monitor update, we shouldn't re-send any channel_ready's.
@@ -4223,10 +4273,10 @@ impl<Signer: Sign> Channel<Signer> {
 		}), None))
 	}
 
-	pub fn shutdown<K: Deref>(
-		&mut self, keys_provider: &K, their_features: &InitFeatures, msg: &msgs::Shutdown
-	) -> Result<(Option<msgs::Shutdown>, Option<ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>), ChannelError>
-	where K::Target: KeysInterface
+	pub fn shutdown<SP: Deref>(
+		&mut self, signer_provider: &SP, their_features: &InitFeatures, msg: &msgs::Shutdown
+	) -> Result<(Option<msgs::Shutdown>, Option<&ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>), ChannelError>
+	where SP::Target: SignerProvider
 	{
 		if self.channel_state & (ChannelState::PeerDisconnected as u32) == ChannelState::PeerDisconnected as u32 {
 			return Err(ChannelError::Close("Peer sent shutdown when we needed a channel_reestablish".to_owned()));
@@ -4265,7 +4315,7 @@ impl<Signer: Sign> Channel<Signer> {
 			Some(_) => false,
 			None => {
 				assert!(send_shutdown);
-				let shutdown_scriptpubkey = keys_provider.get_shutdown_scriptpubkey();
+				let shutdown_scriptpubkey = signer_provider.get_shutdown_scriptpubkey();
 				if !shutdown_scriptpubkey.is_compatible(their_features) {
 					return Err(ChannelError::Close(format!("Provided a scriptpubkey format not accepted by peer: {}", shutdown_scriptpubkey)));
 				}
@@ -4281,12 +4331,15 @@ impl<Signer: Sign> Channel<Signer> {
 
 		let monitor_update = if update_shutdown_script {
 			self.latest_monitor_update_id += 1;
-			Some(ChannelMonitorUpdate {
+			let monitor_update = ChannelMonitorUpdate {
 				update_id: self.latest_monitor_update_id,
 				updates: vec![ChannelMonitorUpdateStep::ShutdownScript {
 					scriptpubkey: self.get_closing_scriptpubkey(),
 				}],
-			})
+			};
+			self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new());
+			self.pending_monitor_updates.push(monitor_update);
+			Some(self.pending_monitor_updates.last().unwrap())
 		} else { None };
 		let shutdown = if send_shutdown {
 			Some(msgs::Shutdown {
@@ -4724,7 +4777,7 @@ impl<Signer: Sign> Channel<Signer> {
 			})
 	}
 
-	pub fn get_feerate(&self) -> u32 {
+	pub fn get_feerate_sat_per_1000_weight(&self) -> u32 {
 		self.feerate_per_kw
 	}
 
@@ -4834,6 +4887,10 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Allowed in any state (including after shutdown)
 	pub fn is_awaiting_monitor_update(&self) -> bool {
 		(self.channel_state & ChannelState::MonitorUpdateInProgress as u32) != 0
+	}
+
+	pub fn get_next_monitor_update(&self) -> Option<&ChannelMonitorUpdate> {
+		self.pending_monitor_updates.first()
 	}
 
 	/// Returns true if funding_created was sent/received.
@@ -4975,9 +5032,14 @@ impl<Signer: Sign> Channel<Signer> {
 	/// When a transaction is confirmed, we check whether it is or spends the funding transaction
 	/// In the first case, we store the confirmation height and calculating the short channel id.
 	/// In the second, we simply return an Err indicating we need to be force-closed now.
-	pub fn transactions_confirmed<L: Deref>(&mut self, block_hash: &BlockHash, height: u32,
-		txdata: &TransactionData, genesis_block_hash: BlockHash, node_pk: PublicKey, logger: &L)
-	-> Result<(Option<msgs::ChannelReady>, Option<msgs::AnnouncementSignatures>), ClosureReason> where L::Target: Logger {
+	pub fn transactions_confirmed<NS: Deref, L: Deref>(
+		&mut self, block_hash: &BlockHash, height: u32, txdata: &TransactionData,
+		genesis_block_hash: BlockHash, node_signer: &NS, user_config: &UserConfig, logger: &L
+	) -> Result<(Option<msgs::ChannelReady>, Option<msgs::AnnouncementSignatures>), ClosureReason>
+	where
+		NS::Target: NodeSigner,
+		L::Target: Logger
+	{
 		if let Some(funding_txo) = self.get_funding_txo() {
 			for &(index_in_block, tx) in txdata.iter() {
 				// Check if the transaction is the expected funding transaction, and if it is,
@@ -5023,7 +5085,7 @@ impl<Signer: Sign> Channel<Signer> {
 					// may have already happened for this block).
 					if let Some(channel_ready) = self.check_get_channel_ready(height) {
 						log_info!(logger, "Sending a channel_ready to our peer for channel {}", log_bytes!(self.channel_id));
-						let announcement_sigs = self.get_announcement_sigs(node_pk, genesis_block_hash, height, logger);
+						let announcement_sigs = self.get_announcement_sigs(node_signer, genesis_block_hash, user_config, height, logger);
 						return Ok((Some(channel_ready), announcement_sigs));
 					}
 				}
@@ -5049,13 +5111,25 @@ impl<Signer: Sign> Channel<Signer> {
 	///
 	/// May return some HTLCs (and their payment_hash) which have timed out and should be failed
 	/// back.
-	pub fn best_block_updated<L: Deref>(&mut self, height: u32, highest_header_time: u32, genesis_block_hash: BlockHash, node_pk: PublicKey, logger: &L)
-	-> Result<(Option<msgs::ChannelReady>, Vec<(HTLCSource, PaymentHash)>, Option<msgs::AnnouncementSignatures>), ClosureReason> where L::Target: Logger {
-		self.do_best_block_updated(height, highest_header_time, Some((genesis_block_hash, node_pk)), logger)
+	pub fn best_block_updated<NS: Deref, L: Deref>(
+		&mut self, height: u32, highest_header_time: u32, genesis_block_hash: BlockHash,
+		node_signer: &NS, user_config: &UserConfig, logger: &L
+	) -> Result<(Option<msgs::ChannelReady>, Vec<(HTLCSource, PaymentHash)>, Option<msgs::AnnouncementSignatures>), ClosureReason>
+	where
+		NS::Target: NodeSigner,
+		L::Target: Logger
+	{
+		self.do_best_block_updated(height, highest_header_time, Some((genesis_block_hash, node_signer, user_config)), logger)
 	}
 
-	fn do_best_block_updated<L: Deref>(&mut self, height: u32, highest_header_time: u32, genesis_node_pk: Option<(BlockHash, PublicKey)>, logger: &L)
-	-> Result<(Option<msgs::ChannelReady>, Vec<(HTLCSource, PaymentHash)>, Option<msgs::AnnouncementSignatures>), ClosureReason> where L::Target: Logger {
+	fn do_best_block_updated<NS: Deref, L: Deref>(
+		&mut self, height: u32, highest_header_time: u32,
+		genesis_node_signer: Option<(BlockHash, &NS, &UserConfig)>, logger: &L
+	) -> Result<(Option<msgs::ChannelReady>, Vec<(HTLCSource, PaymentHash)>, Option<msgs::AnnouncementSignatures>), ClosureReason>
+	where
+		NS::Target: NodeSigner,
+		L::Target: Logger
+	{
 		let mut timed_out_htlcs = Vec::new();
 		// This mirrors the check in ChannelManager::decode_update_add_htlc_onion, refusing to
 		// forward an HTLC when our counterparty should almost certainly just fail it for expiring
@@ -5076,8 +5150,8 @@ impl<Signer: Sign> Channel<Signer> {
 		self.update_time_counter = cmp::max(self.update_time_counter, highest_header_time);
 
 		if let Some(channel_ready) = self.check_get_channel_ready(height) {
-			let announcement_sigs = if let Some((genesis_block_hash, node_pk)) = genesis_node_pk {
-				self.get_announcement_sigs(node_pk, genesis_block_hash, height, logger)
+			let announcement_sigs = if let Some((genesis_block_hash, node_signer, user_config)) = genesis_node_signer {
+				self.get_announcement_sigs(node_signer, genesis_block_hash, user_config, height, logger)
 			} else { None };
 			log_info!(logger, "Sending a channel_ready to our peer for channel {}", log_bytes!(self.channel_id));
 			return Ok((Some(channel_ready), timed_out_htlcs, announcement_sigs));
@@ -5117,8 +5191,8 @@ impl<Signer: Sign> Channel<Signer> {
 			return Err(ClosureReason::FundingTimedOut);
 		}
 
-		let announcement_sigs = if let Some((genesis_block_hash, node_pk)) = genesis_node_pk {
-			self.get_announcement_sigs(node_pk, genesis_block_hash, height, logger)
+		let announcement_sigs = if let Some((genesis_block_hash, node_signer, user_config)) = genesis_node_signer {
+			self.get_announcement_sigs(node_signer, genesis_block_hash, user_config, height, logger)
 		} else { None };
 		Ok((None, timed_out_htlcs, announcement_sigs))
 	}
@@ -5135,7 +5209,7 @@ impl<Signer: Sign> Channel<Signer> {
 			// larger. If we don't know that time has moved forward, we can just set it to the last
 			// time we saw and it will be ignored.
 			let best_time = self.update_time_counter;
-			match self.do_best_block_updated(reorg_height, best_time, None, logger) {
+			match self.do_best_block_updated(reorg_height, best_time, None::<(BlockHash, &&NodeSigner, &UserConfig)>, logger) {
 				Ok((channel_ready, timed_out_htlcs, announcement_sigs)) => {
 					assert!(channel_ready.is_none(), "We can't generate a funding with 0 confirmations?");
 					assert!(timed_out_htlcs.is_empty(), "We can't have accepted HTLCs with a timeout before our funding confirmation?");
@@ -5335,7 +5409,9 @@ impl<Signer: Sign> Channel<Signer> {
 	/// closing).
 	///
 	/// This will only return ChannelError::Ignore upon failure.
-	fn get_channel_announcement(&self, node_id: PublicKey, chain_hash: BlockHash) -> Result<msgs::UnsignedChannelAnnouncement, ChannelError> {
+	fn get_channel_announcement<NS: Deref>(
+		&self, node_signer: &NS, chain_hash: BlockHash, user_config: &UserConfig,
+	) -> Result<msgs::UnsignedChannelAnnouncement, ChannelError> where NS::Target: NodeSigner {
 		if !self.config.announced_channel {
 			return Err(ChannelError::Ignore("Channel is not available for public announcements".to_owned()));
 		}
@@ -5343,24 +5419,33 @@ impl<Signer: Sign> Channel<Signer> {
 			return Err(ChannelError::Ignore("Cannot get a ChannelAnnouncement if the channel is not currently usable".to_owned()));
 		}
 
-		let were_node_one = node_id.serialize()[..] < self.counterparty_node_id.serialize()[..];
+		let node_id = NodeId::from_pubkey(&node_signer.get_node_id(Recipient::Node)
+			.map_err(|_| ChannelError::Ignore("Failed to retrieve own public key".to_owned()))?);
+		let counterparty_node_id = NodeId::from_pubkey(&self.get_counterparty_node_id());
+		let were_node_one = node_id.as_slice() < counterparty_node_id.as_slice();
 
 		let msg = msgs::UnsignedChannelAnnouncement {
-			features: channelmanager::provided_channel_features(),
+			features: channelmanager::provided_channel_features(&user_config),
 			chain_hash,
 			short_channel_id: self.get_short_channel_id().unwrap(),
-			node_id_1: if were_node_one { node_id } else { self.get_counterparty_node_id() },
-			node_id_2: if were_node_one { self.get_counterparty_node_id() } else { node_id },
-			bitcoin_key_1: if were_node_one { self.get_holder_pubkeys().funding_pubkey } else { self.counterparty_funding_pubkey().clone() },
-			bitcoin_key_2: if were_node_one { self.counterparty_funding_pubkey().clone() } else { self.get_holder_pubkeys().funding_pubkey },
+			node_id_1: if were_node_one { node_id } else { counterparty_node_id },
+			node_id_2: if were_node_one { counterparty_node_id } else { node_id },
+			bitcoin_key_1: NodeId::from_pubkey(if were_node_one { &self.get_holder_pubkeys().funding_pubkey } else { self.counterparty_funding_pubkey() }),
+			bitcoin_key_2: NodeId::from_pubkey(if were_node_one { self.counterparty_funding_pubkey() } else { &self.get_holder_pubkeys().funding_pubkey }),
 			excess_data: Vec::new(),
 		};
 
 		Ok(msg)
 	}
 
-	fn get_announcement_sigs<L: Deref>(&mut self, node_pk: PublicKey, genesis_block_hash: BlockHash, best_block_height: u32, logger: &L)
-	-> Option<msgs::AnnouncementSignatures> where L::Target: Logger {
+	fn get_announcement_sigs<NS: Deref, L: Deref>(
+		&mut self, node_signer: &NS, genesis_block_hash: BlockHash, user_config: &UserConfig,
+		best_block_height: u32, logger: &L
+	) -> Option<msgs::AnnouncementSignatures>
+	where
+		NS::Target: NodeSigner,
+		L::Target: Logger
+	{
 		if self.funding_tx_confirmation_height == 0 || self.funding_tx_confirmation_height + 5 > best_block_height {
 			return None;
 		}
@@ -5379,14 +5464,21 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 
 		log_trace!(logger, "Creating an announcement_signatures message for channel {}", log_bytes!(self.channel_id()));
-		let announcement = match self.get_channel_announcement(node_pk, genesis_block_hash) {
+		let announcement = match self.get_channel_announcement(node_signer, genesis_block_hash, user_config) {
 			Ok(a) => a,
-			Err(_) => {
-				log_trace!(logger, "Cannot create an announcement_signatures as channel is not public.");
+			Err(e) => {
+				log_trace!(logger, "{:?}", e);
 				return None;
 			}
 		};
-		let (our_node_sig, our_bitcoin_sig) = match self.holder_signer.sign_channel_announcement(&announcement, &self.secp_ctx) {
+		let our_node_sig = match node_signer.sign_gossip_message(msgs::UnsignedGossipMessage::ChannelAnnouncement(&announcement)) {
+			Err(_) => {
+				log_error!(logger, "Failed to generate node signature for channel_announcement. Channel will not be announced!");
+				return None;
+			},
+			Ok(v) => v
+		};
+		let our_bitcoin_sig = match self.holder_signer.sign_channel_announcement_with_funding_key(&announcement, &self.secp_ctx) {
 			Err(_) => {
 				log_error!(logger, "Signer rejected channel_announcement signing. Channel will not be announced!");
 				return None;
@@ -5405,11 +5497,17 @@ impl<Signer: Sign> Channel<Signer> {
 
 	/// Signs the given channel announcement, returning a ChannelError::Ignore if no keys are
 	/// available.
-	fn sign_channel_announcement(&self, our_node_id: PublicKey, announcement: msgs::UnsignedChannelAnnouncement) -> Result<msgs::ChannelAnnouncement, ChannelError> {
+	fn sign_channel_announcement<NS: Deref>(
+		&self, node_signer: &NS, announcement: msgs::UnsignedChannelAnnouncement
+	) -> Result<msgs::ChannelAnnouncement, ChannelError> where NS::Target: NodeSigner {
 		if let Some((their_node_sig, their_bitcoin_sig)) = self.announcement_sigs {
-			let were_node_one = announcement.node_id_1 == our_node_id;
+			let our_node_key = NodeId::from_pubkey(&node_signer.get_node_id(Recipient::Node)
+				.map_err(|_| ChannelError::Ignore("Signer failed to retrieve own public key".to_owned()))?);
+			let were_node_one = announcement.node_id_1 == our_node_key;
 
-			let (our_node_sig, our_bitcoin_sig) = self.holder_signer.sign_channel_announcement(&announcement, &self.secp_ctx)
+			let our_node_sig = node_signer.sign_gossip_message(msgs::UnsignedGossipMessage::ChannelAnnouncement(&announcement))
+				.map_err(|_| ChannelError::Ignore("Failed to generate node signature for channel_announcement".to_owned()))?;
+			let our_bitcoin_sig = self.holder_signer.sign_channel_announcement_with_funding_key(&announcement, &self.secp_ctx)
 				.map_err(|_| ChannelError::Ignore("Signer rejected channel_announcement".to_owned()))?;
 			Ok(msgs::ChannelAnnouncement {
 				node_signature_1: if were_node_one { our_node_sig } else { their_node_sig },
@@ -5426,8 +5524,11 @@ impl<Signer: Sign> Channel<Signer> {
 	/// Processes an incoming announcement_signatures message, providing a fully-signed
 	/// channel_announcement message which we can broadcast and storing our counterparty's
 	/// signatures for later reconstruction/rebroadcast of the channel_announcement.
-	pub fn announcement_signatures(&mut self, our_node_id: PublicKey, chain_hash: BlockHash, best_block_height: u32, msg: &msgs::AnnouncementSignatures) -> Result<msgs::ChannelAnnouncement, ChannelError> {
-		let announcement = self.get_channel_announcement(our_node_id.clone(), chain_hash)?;
+	pub fn announcement_signatures<NS: Deref>(
+		&mut self, node_signer: &NS, chain_hash: BlockHash, best_block_height: u32,
+		msg: &msgs::AnnouncementSignatures, user_config: &UserConfig
+	) -> Result<msgs::ChannelAnnouncement, ChannelError> where NS::Target: NodeSigner {
+		let announcement = self.get_channel_announcement(node_signer, chain_hash, user_config)?;
 
 		let msghash = hash_to_message!(&Sha256d::hash(&announcement.encode()[..])[..]);
 
@@ -5448,20 +5549,22 @@ impl<Signer: Sign> Channel<Signer> {
 				"Got announcement_signatures prior to the required six confirmations - we may not have received a block yet that our peer has".to_owned()));
 		}
 
-		self.sign_channel_announcement(our_node_id, announcement)
+		self.sign_channel_announcement(node_signer, announcement)
 	}
 
 	/// Gets a signed channel_announcement for this channel, if we previously received an
 	/// announcement_signatures from our counterparty.
-	pub fn get_signed_channel_announcement(&self, our_node_id: PublicKey, chain_hash: BlockHash, best_block_height: u32) -> Option<msgs::ChannelAnnouncement> {
+	pub fn get_signed_channel_announcement<NS: Deref>(
+		&self, node_signer: &NS, chain_hash: BlockHash, best_block_height: u32, user_config: &UserConfig
+	) -> Option<msgs::ChannelAnnouncement> where NS::Target: NodeSigner {
 		if self.funding_tx_confirmation_height == 0 || self.funding_tx_confirmation_height + 5 > best_block_height {
 			return None;
 		}
-		let announcement = match self.get_channel_announcement(our_node_id.clone(), chain_hash) {
+		let announcement = match self.get_channel_announcement(node_signer, chain_hash, user_config) {
 			Ok(res) => res,
 			Err(_) => return None,
 		};
-		match self.sign_channel_announcement(our_node_id, announcement) {
+		match self.sign_channel_announcement(node_signer, announcement) {
 			Ok(res) => Some(res),
 			Err(_) => None,
 		}
@@ -5690,8 +5793,7 @@ impl<Signer: Sign> Channel<Signer> {
 		Ok(Some(res))
 	}
 
-	/// Only fails in case of bad keys
-	fn send_commitment_no_status_check<L: Deref>(&mut self, logger: &L) -> Result<(msgs::CommitmentSigned, ChannelMonitorUpdate), ChannelError> where L::Target: Logger {
+	fn build_commitment_no_status_check<L: Deref>(&mut self, logger: &L) -> ChannelMonitorUpdate where L::Target: Logger {
 		log_trace!(logger, "Updating HTLC state for a newly-sent commitment_signed...");
 		// We can upgrade the status of some HTLCs that are waiting on a commitment, even if we
 		// fail to generate this, we still are at least at a position where upgrading their status
@@ -5724,15 +5826,9 @@ impl<Signer: Sign> Channel<Signer> {
 		}
 		self.resend_order = RAACommitmentOrder::RevokeAndACKFirst;
 
-		let (res, counterparty_commitment_txid, htlcs) = match self.send_commitment_no_state_update(logger) {
-			Ok((res, (counterparty_commitment_tx, mut htlcs))) => {
-				// Update state now that we've passed all the can-fail calls...
-				let htlcs_no_ref: Vec<(HTLCOutputInCommitment, Option<Box<HTLCSource>>)> =
-					htlcs.drain(..).map(|(htlc, htlc_source)| (htlc, htlc_source.map(|source_ref| Box::new(source_ref.clone())))).collect();
-				(res, counterparty_commitment_tx, htlcs_no_ref)
-			},
-			Err(e) => return Err(e),
-		};
+		let (counterparty_commitment_txid, mut htlcs_ref) = self.build_commitment_no_state_update(logger);
+		let htlcs: Vec<(HTLCOutputInCommitment, Option<Box<HTLCSource>>)> =
+			htlcs_ref.drain(..).map(|(htlc, htlc_source)| (htlc, htlc_source.map(|source_ref| Box::new(source_ref.clone())))).collect();
 
 		if self.announcement_sigs_state == AnnouncementSigsState::MessageSent {
 			self.announcement_sigs_state = AnnouncementSigsState::Committed;
@@ -5749,16 +5845,13 @@ impl<Signer: Sign> Channel<Signer> {
 			}]
 		};
 		self.channel_state |= ChannelState::AwaitingRemoteRevoke as u32;
-		Ok((res, monitor_update))
+		monitor_update
 	}
 
-	/// Only fails in case of bad keys. Used for channel_reestablish commitment_signed generation
-	/// when we shouldn't change HTLC/channel state.
-	fn send_commitment_no_state_update<L: Deref>(&self, logger: &L) -> Result<(msgs::CommitmentSigned, (Txid, Vec<(HTLCOutputInCommitment, Option<&HTLCSource>)>)), ChannelError> where L::Target: Logger {
+	fn build_commitment_no_state_update<L: Deref>(&self, logger: &L) -> (Txid, Vec<(HTLCOutputInCommitment, Option<&HTLCSource>)>) where L::Target: Logger {
 		let counterparty_keys = self.build_remote_transaction_keys();
 		let commitment_stats = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
 		let counterparty_commitment_txid = commitment_stats.tx.trust().txid();
-		let (signature, htlc_signatures);
 
 		#[cfg(any(test, fuzzing))]
 		{
@@ -5777,6 +5870,21 @@ impl<Signer: Sign> Channel<Signer> {
 				}
 			}
 		}
+
+		(counterparty_commitment_txid, commitment_stats.htlcs_included)
+	}
+
+	/// Only fails in case of signer rejection. Used for channel_reestablish commitment_signed
+	/// generation when we shouldn't change HTLC/channel state.
+	fn send_commitment_no_state_update<L: Deref>(&self, logger: &L) -> Result<(msgs::CommitmentSigned, (Txid, Vec<(HTLCOutputInCommitment, Option<&HTLCSource>)>)), ChannelError> where L::Target: Logger {
+		// Get the fee tests from `build_commitment_no_state_update`
+		#[cfg(any(test, fuzzing))]
+		self.build_commitment_no_state_update(logger);
+
+		let counterparty_keys = self.build_remote_transaction_keys();
+		let commitment_stats = self.build_commitment_transaction(self.cur_counterparty_commitment_transaction_number, &counterparty_keys, false, true, logger);
+		let counterparty_commitment_txid = commitment_stats.tx.trust().txid();
+		let (signature, htlc_signatures);
 
 		{
 			let mut htlcs = Vec::with_capacity(commitment_stats.htlcs_included.len());
@@ -5810,16 +5918,20 @@ impl<Signer: Sign> Channel<Signer> {
 		}, (counterparty_commitment_txid, commitment_stats.htlcs_included)))
 	}
 
-	/// Adds a pending outbound HTLC to this channel, and creates a signed commitment transaction
-	/// to send to the remote peer in one go.
+	/// Adds a pending outbound HTLC to this channel, and builds a new remote commitment
+	/// transaction and generates the corresponding [`ChannelMonitorUpdate`] in one go.
 	///
 	/// Shorthand for calling [`Self::send_htlc`] followed by a commitment update, see docs on
-	/// [`Self::send_htlc`] and [`Self::send_commitment_no_state_update`] for more info.
-	pub fn send_htlc_and_commit<L: Deref>(&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource, onion_routing_packet: msgs::OnionPacket, logger: &L) -> Result<Option<(msgs::UpdateAddHTLC, msgs::CommitmentSigned, ChannelMonitorUpdate)>, ChannelError> where L::Target: Logger {
-		match self.send_htlc(amount_msat, payment_hash, cltv_expiry, source, onion_routing_packet, false, logger)? {
-			Some(update_add_htlc) => {
-				let (commitment_signed, monitor_update) = self.send_commitment_no_status_check(logger)?;
-				Ok(Some((update_add_htlc, commitment_signed, monitor_update)))
+	/// [`Self::send_htlc`] and [`Self::build_commitment_no_state_update`] for more info.
+	pub fn send_htlc_and_commit<L: Deref>(&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32, source: HTLCSource, onion_routing_packet: msgs::OnionPacket, logger: &L) -> Result<Option<&ChannelMonitorUpdate>, ChannelError> where L::Target: Logger {
+		let send_res = self.send_htlc(amount_msat, payment_hash, cltv_expiry, source, onion_routing_packet, false, logger);
+		if let Err(e) = &send_res { if let ChannelError::Ignore(_) = e {} else { debug_assert!(false, "Sending cannot trigger channel failure"); } }
+		match send_res? {
+			Some(_) => {
+				let monitor_update = self.build_commitment_no_status_check(logger);
+				self.monitor_updating_paused(false, true, false, Vec::new(), Vec::new(), Vec::new());
+				self.pending_monitor_updates.push(monitor_update);
+				Ok(Some(self.pending_monitor_updates.last().unwrap()))
 			},
 			None => Ok(None)
 		}
@@ -5845,9 +5957,13 @@ impl<Signer: Sign> Channel<Signer> {
 
 	/// Begins the shutdown process, getting a message for the remote peer and returning all
 	/// holding cell HTLCs for payment failure.
-	pub fn get_shutdown<K: Deref>(&mut self, keys_provider: &K, their_features: &InitFeatures, target_feerate_sats_per_kw: Option<u32>)
-	-> Result<(msgs::Shutdown, Option<ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>), APIError>
-	where K::Target: KeysInterface {
+	///
+	/// May jump to the channel being fully shutdown (see [`Self::is_shutdown`]) in which case no
+	/// [`ChannelMonitorUpdate`] will be returned).
+	pub fn get_shutdown<SP: Deref>(&mut self, signer_provider: &SP, their_features: &InitFeatures,
+		target_feerate_sats_per_kw: Option<u32>)
+	-> Result<(msgs::Shutdown, Option<&ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>), APIError>
+	where SP::Target: SignerProvider {
 		for htlc in self.pending_outbound_htlcs.iter() {
 			if let OutboundHTLCState::LocalAnnounced(_) = htlc.state {
 				return Err(APIError::APIMisuseError{err: "Cannot begin shutdown with pending HTLCs. Process pending events first".to_owned()});
@@ -5866,16 +5982,24 @@ impl<Signer: Sign> Channel<Signer> {
 			return Err(APIError::ChannelUnavailable{err: "Cannot begin shutdown while peer is disconnected or we're waiting on a monitor update, maybe force-close instead?".to_owned()});
 		}
 
+		// If we haven't funded the channel yet, we don't need to bother ensuring the shutdown
+		// script is set, we just force-close and call it a day.
+		let mut chan_closed = false;
+		if self.channel_state < ChannelState::FundingSent as u32 {
+			chan_closed = true;
+		}
+
 		let update_shutdown_script = match self.shutdown_scriptpubkey {
 			Some(_) => false,
-			None => {
-				let shutdown_scriptpubkey = keys_provider.get_shutdown_scriptpubkey();
+			None if !chan_closed => {
+				let shutdown_scriptpubkey = signer_provider.get_shutdown_scriptpubkey();
 				if !shutdown_scriptpubkey.is_compatible(their_features) {
 					return Err(APIError::IncompatibleShutdownScript { script: shutdown_scriptpubkey.clone() });
 				}
 				self.shutdown_scriptpubkey = Some(shutdown_scriptpubkey);
 				true
 			},
+			None => false,
 		};
 
 		// From here on out, we may not fail!
@@ -5889,12 +6013,15 @@ impl<Signer: Sign> Channel<Signer> {
 
 		let monitor_update = if update_shutdown_script {
 			self.latest_monitor_update_id += 1;
-			Some(ChannelMonitorUpdate {
+			let monitor_update = ChannelMonitorUpdate {
 				update_id: self.latest_monitor_update_id,
 				updates: vec![ChannelMonitorUpdateStep::ShutdownScript {
 					scriptpubkey: self.get_closing_scriptpubkey(),
 				}],
-			})
+			};
+			self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new());
+			self.pending_monitor_updates.push(monitor_update);
+			Some(self.pending_monitor_updates.last().unwrap())
 		} else { None };
 		let shutdown = msgs::Shutdown {
 			channel_id: self.channel_id,
@@ -5914,6 +6041,9 @@ impl<Signer: Sign> Channel<Signer> {
 				_ => true
 			}
 		});
+
+		debug_assert!(!self.is_shutdown() || monitor_update.is_none(),
+			"we can't both complete shutdown and return a monitor update");
 
 		Ok((shutdown, monitor_update, dropped_outbound_htlcs))
 	}
@@ -6034,7 +6164,7 @@ impl Readable for AnnouncementSigsState {
 	}
 }
 
-impl<Signer: Sign> Writeable for Channel<Signer> {
+impl<Signer: WriteableEcdsaChannelSigner> Writeable for Channel<Signer> {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
 		// Note that we write out as if remove_uncommitted_htlcs_and_mark_paused had just been
 		// called.
@@ -6329,10 +6459,13 @@ impl<Signer: Sign> Writeable for Channel<Signer> {
 }
 
 const MAX_ALLOC_SIZE: usize = 64*1024;
-impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInterface>::Signer>
-		where K::Target: KeysInterface {
-	fn read<R : io::Read>(reader: &mut R, args: (&'a K, u32)) -> Result<Self, DecodeError> {
-		let (keys_source, serialized_height) = args;
+impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c ChannelTypeFeatures)> for Channel<<SP::Target as SignerProvider>::Signer>
+		where
+			ES::Target: EntropySource,
+			SP::Target: SignerProvider
+{
+	fn read<R : io::Read>(reader: &mut R, args: (&'a ES, &'b SP, u32, &'c ChannelTypeFeatures)) -> Result<Self, DecodeError> {
+		let (entropy_source, signer_provider, serialized_height, our_supported_features) = args;
 		let ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 
 		// `user_id` used to be a single u64 value. In order to remain backwards compatible with
@@ -6613,7 +6746,7 @@ impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInte
 		});
 
 		let (channel_keys_id, holder_signer) = if let Some(channel_keys_id) = channel_keys_id {
-			let mut holder_signer = keys_source.derive_channel_signer(channel_value_satoshis, channel_keys_id);
+			let mut holder_signer = signer_provider.derive_channel_signer(channel_value_satoshis, channel_keys_id);
 			// If we've gotten to the funding stage of the channel, populate the signer with its
 			// required channel parameters.
 			let non_shutdown_state = channel_state & (!MULTI_STATE_FLAGS);
@@ -6624,7 +6757,7 @@ impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInte
 		} else {
 			// `keys_data` can be `None` if we had corrupted data.
 			let keys_data = keys_data.ok_or(DecodeError::InvalidValue)?;
-			let holder_signer = keys_source.read_chan_signer(&keys_data)?;
+			let holder_signer = signer_provider.read_chan_signer(&keys_data)?;
 			(holder_signer.channel_keys_id(), holder_signer)
 		};
 
@@ -6648,19 +6781,14 @@ impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInte
 		}
 
 		let chan_features = channel_type.as_ref().unwrap();
-		if chan_features.supports_unknown_bits() || chan_features.requires_unknown_bits() {
+		if !chan_features.is_subset(our_supported_features) {
 			// If the channel was written by a new version and negotiated with features we don't
 			// understand yet, refuse to read it.
 			return Err(DecodeError::UnknownRequiredFeature);
 		}
 
-		if channel_parameters.opt_anchors.is_some() {
-			// Relax this check when ChannelTypeFeatures supports anchors.
-			return Err(DecodeError::InvalidValue);
-		}
-
 		let mut secp_ctx = Secp256k1::new();
-		secp_ctx.seeded_randomize(&keys_source.get_secure_random_bytes());
+		secp_ctx.seeded_randomize(&entropy_source.get_secure_random_bytes());
 
 		// `user_id` used to be a single u64 value. In order to remain backwards
 		// compatible with versions prior to 0.0.113, the u128 is serialized as two
@@ -6778,6 +6906,8 @@ impl<'a, K: Deref> ReadableArgs<(&'a K, u32)> for Channel<<K::Target as KeysInte
 
 			channel_type: channel_type.unwrap(),
 			channel_keys_id,
+
+			pending_monitor_updates: Vec::new(),
 		})
 	}
 }
@@ -6793,6 +6923,8 @@ mod tests {
 	use hex;
 	use crate::ln::PaymentHash;
 	use crate::ln::channelmanager::{self, HTLCSource, PaymentId};
+	#[cfg(anchors)]
+	use crate::ln::channel::InitFeatures;
 	use crate::ln::channel::{Channel, InboundHTLCOutput, OutboundHTLCOutput, InboundHTLCState, OutboundHTLCState, HTLCCandidate, HTLCInitiator};
 	use crate::ln::channel::{MAX_FUNDING_SATOSHIS_NO_WUMBO, TOTAL_BITCOIN_SUPPLY_SATOSHIS, MIN_THEIR_CHAN_RESERVE_SATOSHIS};
 	use crate::ln::features::ChannelTypeFeatures;
@@ -6802,22 +6934,19 @@ mod tests {
 	use crate::ln::chan_utils::{htlc_success_tx_weight, htlc_timeout_tx_weight};
 	use crate::chain::BestBlock;
 	use crate::chain::chaininterface::{FeeEstimator, LowerBoundedFeeEstimator, ConfirmationTarget};
-	use crate::chain::keysinterface::{BaseSign, InMemorySigner, Recipient, KeyMaterial, KeysInterface};
+	use crate::chain::keysinterface::{ChannelSigner, InMemorySigner, EntropySource, SignerProvider};
 	use crate::chain::transaction::OutPoint;
 	use crate::util::config::UserConfig;
 	use crate::util::enforcing_trait_impls::EnforcingSigner;
 	use crate::util::errors::APIError;
 	use crate::util::test_utils;
 	use crate::util::test_utils::OnGetShutdownScriptpubkey;
-	use bitcoin::secp256k1::{Secp256k1, ecdsa::Signature, Scalar};
+	use bitcoin::secp256k1::{Secp256k1, ecdsa::Signature};
 	use bitcoin::secp256k1::ffi::Signature as FFISignature;
 	use bitcoin::secp256k1::{SecretKey,PublicKey};
-	use bitcoin::secp256k1::ecdh::SharedSecret;
-	use bitcoin::secp256k1::ecdsa::RecoverableSignature;
 	use bitcoin::hashes::sha256::Hash as Sha256;
 	use bitcoin::hashes::Hash;
 	use bitcoin::hash_types::WPubkeyHash;
-	use bitcoin::bech32::u5;
 	use bitcoin::PackedLockTime;
 	use bitcoin::util::address::WitnessVersion;
 	use crate::prelude::*;
@@ -6851,12 +6980,24 @@ mod tests {
 	struct Keys {
 		signer: InMemorySigner,
 	}
-	impl KeysInterface for Keys {
+
+	impl EntropySource for Keys {
+		fn get_secure_random_bytes(&self) -> [u8; 32] { [0; 32] }
+	}
+
+	impl SignerProvider for Keys {
 		type Signer = InMemorySigner;
 
-		fn get_node_secret(&self, _recipient: Recipient) -> Result<SecretKey, ()> { panic!(); }
-		fn ecdh(&self, _recipient: Recipient, _other_key: &PublicKey, _tweak: Option<&Scalar>) -> Result<SharedSecret, ()> { panic!(); }
-		fn get_inbound_payment_key_material(&self) -> KeyMaterial { panic!(); }
+		fn generate_channel_keys_id(&self, _inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128) -> [u8; 32] {
+			self.signer.channel_keys_id()
+		}
+
+		fn derive_channel_signer(&self, _channel_value_satoshis: u64, _channel_keys_id: [u8; 32]) -> Self::Signer {
+			self.signer.clone()
+		}
+
+		fn read_chan_signer(&self, _data: &[u8]) -> Result<Self::Signer, DecodeError> { panic!(); }
+
 		fn get_destination_script(&self) -> Script {
 			let secp_ctx = Secp256k1::signing_only();
 			let channel_monitor_claim_key = SecretKey::from_slice(&hex::decode("0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").unwrap()[..]).unwrap();
@@ -6869,16 +7010,6 @@ mod tests {
 			let channel_close_key = SecretKey::from_slice(&hex::decode("0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").unwrap()[..]).unwrap();
 			ShutdownScript::new_p2wpkh_from_pubkey(PublicKey::from_secret_key(&secp_ctx, &channel_close_key))
 		}
-
-		fn generate_channel_keys_id(&self, _inbound: bool, _channel_value_satoshis: u64, _user_channel_id: u128) -> [u8; 32] {
-			self.signer.channel_keys_id()
-		}
-		fn derive_channel_signer(&self, _channel_value_satoshis: u64, _channel_keys_id: [u8; 32]) -> Self::Signer {
-			self.signer.clone()
-		}
-		fn get_secure_random_bytes(&self) -> [u8; 32] { [0; 32] }
-		fn read_chan_signer(&self, _data: &[u8]) -> Result<Self::Signer, DecodeError> { panic!(); }
-		fn sign_invoice(&self, _hrp_bytes: &[u8], _invoice_data: &[u5], _recipient: Recipient) -> Result<RecoverableSignature, ()> { panic!(); }
 	}
 
 	#[cfg(not(feature = "grind_signatures"))]
@@ -6888,7 +7019,7 @@ mod tests {
 
 	#[test]
 	fn upfront_shutdown_script_incompatibility() {
-		let features = channelmanager::provided_init_features().clear_shutdown_anysegwit();
+		let features = channelmanager::provided_init_features(&UserConfig::default()).clear_shutdown_anysegwit();
 		let non_v0_segwit_shutdown_script =
 			ShutdownScript::new_witness_program(WitnessVersion::V16, &[0, 40]).unwrap();
 
@@ -6902,7 +7033,7 @@ mod tests {
 		let secp_ctx = Secp256k1::new();
 		let node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		match Channel::<EnforcingSigner>::new_outbound(&LowerBoundedFeeEstimator::new(&TestFeeEstimator { fee_est: 253 }), &&keys_provider, node_id, &features, 10000000, 100000, 42, &config, 0, 42) {
+		match Channel::<EnforcingSigner>::new_outbound(&LowerBoundedFeeEstimator::new(&TestFeeEstimator { fee_est: 253 }), &&keys_provider, &&keys_provider, node_id, &features, 10000000, 100000, 42, &config, 0, 42) {
 			Err(APIError::IncompatibleShutdownScript { script }) => {
 				assert_eq!(script.into_inner(), non_v0_segwit_shutdown_script.into_inner());
 			},
@@ -6925,7 +7056,7 @@ mod tests {
 
 		let node_a_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let node_a_chan = Channel::<EnforcingSigner>::new_outbound(&bounded_fee_estimator, &&keys_provider, node_a_node_id, &channelmanager::provided_init_features(), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let node_a_chan = Channel::<EnforcingSigner>::new_outbound(&bounded_fee_estimator, &&keys_provider, &&keys_provider, node_a_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		// Now change the fee so we can check that the fee in the open_channel message is the
 		// same as the old fee.
@@ -6951,18 +7082,18 @@ mod tests {
 		// Create Node A's channel pointing to Node B's pubkey
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let mut node_a_chan = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let mut node_a_chan = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		// Create Node B's channel by receiving Node A's open_channel message
 		// Make sure A's dust limit is as we expect.
 		let open_channel_msg = node_a_chan.get_open_channel(genesis_block(network).header.block_hash());
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[7; 32]).unwrap());
-		let mut node_b_chan = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(), &open_channel_msg, 7, &config, 0, &&logger, 42).unwrap();
+		let mut node_b_chan = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, 42).unwrap();
 
 		// Node B --> Node A: accept channel, explicitly setting B's dust limit.
 		let mut accept_channel_msg = node_b_chan.accept_inbound_channel(0);
 		accept_channel_msg.dust_limit_satoshis = 546;
-		node_a_chan.accept_channel(&accept_channel_msg, &config.channel_handshake_limits, &channelmanager::provided_init_features()).unwrap();
+		node_a_chan.accept_channel(&accept_channel_msg, &config.channel_handshake_limits, &channelmanager::provided_init_features(&config)).unwrap();
 		node_a_chan.holder_dust_limit_satoshis = 1560;
 
 		// Put some inbound and outbound HTLCs in A's channel.
@@ -6987,7 +7118,6 @@ mod tests {
 				first_hop_htlc_msat: 548,
 				payment_id: PaymentId([42; 32]),
 				payment_secret: None,
-				payment_params: None,
 			}
 		});
 
@@ -7021,7 +7151,7 @@ mod tests {
 
 		let node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let mut chan = Channel::<EnforcingSigner>::new_outbound(&fee_est, &&keys_provider, node_id, &channelmanager::provided_init_features(), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let mut chan = Channel::<EnforcingSigner>::new_outbound(&fee_est, &&keys_provider, &&keys_provider, node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		let commitment_tx_fee_0_htlcs = Channel::<EnforcingSigner>::commit_tx_fee_msat(chan.feerate_per_kw, 0, chan.opt_anchors());
 		let commitment_tx_fee_1_htlc = Channel::<EnforcingSigner>::commit_tx_fee_msat(chan.feerate_per_kw, 1, chan.opt_anchors());
@@ -7061,7 +7191,7 @@ mod tests {
 		let secp_ctx = Secp256k1::new();
 		let seed = [42; 32];
 		let network = Network::Testnet;
-		let best_block = BestBlock::from_genesis(network);
+		let best_block = BestBlock::from_network(network);
 		let chain_hash = best_block.block_hash();
 		let keys_provider = test_utils::TestKeysInterface::new(&seed, network);
 
@@ -7070,16 +7200,16 @@ mod tests {
 		// Create Node A's channel pointing to Node B's pubkey
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let mut node_a_chan = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let mut node_a_chan = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		// Create Node B's channel by receiving Node A's open_channel message
 		let open_channel_msg = node_a_chan.get_open_channel(chain_hash);
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[7; 32]).unwrap());
-		let mut node_b_chan = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(), &open_channel_msg, 7, &config, 0, &&logger, 42).unwrap();
+		let mut node_b_chan = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, 42).unwrap();
 
 		// Node B --> Node A: accept channel
 		let accept_channel_msg = node_b_chan.accept_inbound_channel(0);
-		node_a_chan.accept_channel(&accept_channel_msg, &config.channel_handshake_limits, &channelmanager::provided_init_features()).unwrap();
+		node_a_chan.accept_channel(&accept_channel_msg, &config.channel_handshake_limits, &channelmanager::provided_init_features(&config)).unwrap();
 
 		// Node A --> Node B: funding created
 		let output_script = node_a_chan.get_funding_redeemscript();
@@ -7088,7 +7218,7 @@ mod tests {
 		}]};
 		let funding_outpoint = OutPoint{ txid: tx.txid(), index: 0 };
 		let funding_created_msg = node_a_chan.get_outbound_funding_created(tx.clone(), funding_outpoint, &&logger).unwrap();
-		let (funding_signed_msg, _, _) = node_b_chan.funding_created(&funding_created_msg, best_block, &&keys_provider, &&logger).unwrap();
+		let (funding_signed_msg, _) = node_b_chan.funding_created(&funding_created_msg, best_block, &&keys_provider, &&logger).unwrap();
 
 		// Node B --> Node A: funding signed
 		let _ = node_a_chan.funding_signed(&funding_signed_msg, best_block, &&keys_provider, &&logger);
@@ -7143,12 +7273,12 @@ mod tests {
 		// Test that `new_outbound` creates a channel with the correct value for
 		// `holder_max_htlc_value_in_flight_msat`, when configured with a valid percentage value,
 		// which is set to the lower bound + 1 (2%) of the `channel_value`.
-		let chan_1 = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(), 10000000, 100000, 42, &config_2_percent, 0, 42).unwrap();
+		let chan_1 = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_2_percent), 10000000, 100000, 42, &config_2_percent, 0, 42).unwrap();
 		let chan_1_value_msat = chan_1.channel_value_satoshis * 1000;
 		assert_eq!(chan_1.holder_max_htlc_value_in_flight_msat, (chan_1_value_msat as f64 * 0.02) as u64);
 
 		// Test with the upper bound - 1 of valid values (99%).
-		let chan_2 = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(), 10000000, 100000, 42, &config_99_percent, 0, 42).unwrap();
+		let chan_2 = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_99_percent), 10000000, 100000, 42, &config_99_percent, 0, 42).unwrap();
 		let chan_2_value_msat = chan_2.channel_value_satoshis * 1000;
 		assert_eq!(chan_2.holder_max_htlc_value_in_flight_msat, (chan_2_value_msat as f64 * 0.99) as u64);
 
@@ -7157,38 +7287,38 @@ mod tests {
 		// Test that `new_from_req` creates a channel with the correct value for
 		// `holder_max_htlc_value_in_flight_msat`, when configured with a valid percentage value,
 		// which is set to the lower bound - 1 (2%) of the `channel_value`.
-		let chan_3 = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, inbound_node_id, &channelmanager::provided_init_features(), &chan_1_open_channel_msg, 7, &config_2_percent, 0, &&logger, 42).unwrap();
+		let chan_3 = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_2_percent), &channelmanager::provided_init_features(&config_2_percent), &chan_1_open_channel_msg, 7, &config_2_percent, 0, &&logger, 42).unwrap();
 		let chan_3_value_msat = chan_3.channel_value_satoshis * 1000;
 		assert_eq!(chan_3.holder_max_htlc_value_in_flight_msat, (chan_3_value_msat as f64 * 0.02) as u64);
 
 		// Test with the upper bound - 1 of valid values (99%).
-		let chan_4 = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, inbound_node_id, &channelmanager::provided_init_features(), &chan_1_open_channel_msg, 7, &config_99_percent, 0, &&logger, 42).unwrap();
+		let chan_4 = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_99_percent), &channelmanager::provided_init_features(&config_99_percent), &chan_1_open_channel_msg, 7, &config_99_percent, 0, &&logger, 42).unwrap();
 		let chan_4_value_msat = chan_4.channel_value_satoshis * 1000;
 		assert_eq!(chan_4.holder_max_htlc_value_in_flight_msat, (chan_4_value_msat as f64 * 0.99) as u64);
 
 		// Test that `new_outbound` uses the lower bound of the configurable percentage values (1%)
 		// if `max_inbound_htlc_value_in_flight_percent_of_channel` is set to a value less than 1.
-		let chan_5 = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(), 10000000, 100000, 42, &config_0_percent, 0, 42).unwrap();
+		let chan_5 = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_0_percent), 10000000, 100000, 42, &config_0_percent, 0, 42).unwrap();
 		let chan_5_value_msat = chan_5.channel_value_satoshis * 1000;
 		assert_eq!(chan_5.holder_max_htlc_value_in_flight_msat, (chan_5_value_msat as f64 * 0.01) as u64);
 
 		// Test that `new_outbound` uses the upper bound of the configurable percentage values
 		// (100%) if `max_inbound_htlc_value_in_flight_percent_of_channel` is set to a larger value
 		// than 100.
-		let chan_6 = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(), 10000000, 100000, 42, &config_101_percent, 0, 42).unwrap();
+		let chan_6 = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&config_101_percent), 10000000, 100000, 42, &config_101_percent, 0, 42).unwrap();
 		let chan_6_value_msat = chan_6.channel_value_satoshis * 1000;
 		assert_eq!(chan_6.holder_max_htlc_value_in_flight_msat, chan_6_value_msat);
 
 		// Test that `new_from_req` uses the lower bound of the configurable percentage values (1%)
 		// if `max_inbound_htlc_value_in_flight_percent_of_channel` is set to a value less than 1.
-		let chan_7 = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, inbound_node_id, &channelmanager::provided_init_features(), &chan_1_open_channel_msg, 7, &config_0_percent, 0, &&logger, 42).unwrap();
+		let chan_7 = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_0_percent), &channelmanager::provided_init_features(&config_0_percent), &chan_1_open_channel_msg, 7, &config_0_percent, 0, &&logger, 42).unwrap();
 		let chan_7_value_msat = chan_7.channel_value_satoshis * 1000;
 		assert_eq!(chan_7.holder_max_htlc_value_in_flight_msat, (chan_7_value_msat as f64 * 0.01) as u64);
 
 		// Test that `new_from_req` uses the upper bound of the configurable percentage values
 		// (100%) if `max_inbound_htlc_value_in_flight_percent_of_channel` is set to a larger value
 		// than 100.
-		let chan_8 = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, inbound_node_id, &channelmanager::provided_init_features(), &chan_1_open_channel_msg, 7, &config_101_percent, 0, &&logger, 42).unwrap();
+		let chan_8 = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&config_101_percent), &channelmanager::provided_init_features(&config_101_percent), &chan_1_open_channel_msg, 7, &config_101_percent, 0, &&logger, 42).unwrap();
 		let chan_8_value_msat = chan_8.channel_value_satoshis * 1000;
 		assert_eq!(chan_8.holder_max_htlc_value_in_flight_msat, chan_8_value_msat);
 	}
@@ -7228,7 +7358,7 @@ mod tests {
 
 		let mut outbound_node_config = UserConfig::default();
 		outbound_node_config.channel_handshake_config.their_channel_reserve_proportional_millionths = (outbound_selected_channel_reserve_perc * 1_000_000.0) as u32;
-		let chan = Channel::<EnforcingSigner>::new_outbound(&&fee_est, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(), channel_value_satoshis, 100_000, 42, &outbound_node_config, 0, 42).unwrap();
+		let chan = Channel::<EnforcingSigner>::new_outbound(&&fee_est, &&keys_provider, &&keys_provider, outbound_node_id, &channelmanager::provided_init_features(&outbound_node_config), channel_value_satoshis, 100_000, 42, &outbound_node_config, 0, 42).unwrap();
 
 		let expected_outbound_selected_chan_reserve = cmp::max(MIN_THEIR_CHAN_RESERVE_SATOSHIS, (chan.channel_value_satoshis as f64 * outbound_selected_channel_reserve_perc) as u64);
 		assert_eq!(chan.holder_selected_channel_reserve_satoshis, expected_outbound_selected_chan_reserve);
@@ -7238,7 +7368,7 @@ mod tests {
 		inbound_node_config.channel_handshake_config.their_channel_reserve_proportional_millionths = (inbound_selected_channel_reserve_perc * 1_000_000.0) as u32;
 
 		if outbound_selected_channel_reserve_perc + inbound_selected_channel_reserve_perc < 1.0 {
-			let chan_inbound_node = Channel::<EnforcingSigner>::new_from_req(&&fee_est, &&keys_provider, inbound_node_id, &channelmanager::provided_init_features(), &chan_open_channel_msg, 7, &inbound_node_config, 0, &&logger, 42).unwrap();
+			let chan_inbound_node = Channel::<EnforcingSigner>::new_from_req(&&fee_est, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&inbound_node_config), &channelmanager::provided_init_features(&outbound_node_config), &chan_open_channel_msg, 7, &inbound_node_config, 0, &&logger, 42).unwrap();
 
 			let expected_inbound_selected_chan_reserve = cmp::max(MIN_THEIR_CHAN_RESERVE_SATOSHIS, (chan.channel_value_satoshis as f64 * inbound_selected_channel_reserve_perc) as u64);
 
@@ -7246,7 +7376,7 @@ mod tests {
 			assert_eq!(chan_inbound_node.counterparty_selected_channel_reserve_satoshis.unwrap(), expected_outbound_selected_chan_reserve);
 		} else {
 			// Channel Negotiations failed
-			let result = Channel::<EnforcingSigner>::new_from_req(&&fee_est, &&keys_provider, inbound_node_id, &channelmanager::provided_init_features(), &chan_open_channel_msg, 7, &inbound_node_config, 0, &&logger, 42);
+			let result = Channel::<EnforcingSigner>::new_from_req(&&fee_est, &&keys_provider, &&keys_provider, inbound_node_id, &channelmanager::provided_channel_type_features(&inbound_node_config), &channelmanager::provided_init_features(&outbound_node_config), &chan_open_channel_msg, 7, &inbound_node_config, 0, &&logger, 42);
 			assert!(result.is_err());
 		}
 	}
@@ -7263,7 +7393,7 @@ mod tests {
 		// Create a channel.
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let mut node_a_chan = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let mut node_a_chan = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, &&keys_provider, node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 		assert!(node_a_chan.counterparty_forwarding_info.is_none());
 		assert_eq!(node_a_chan.holder_htlc_minimum_msat, 1); // the default
 		assert!(node_a_chan.counterparty_forwarding_info().is_none());
@@ -7308,7 +7438,7 @@ mod tests {
 		use bitcoin::hashes::hex::FromHex;
 		use bitcoin::hash_types::Txid;
 		use bitcoin::secp256k1::Message;
-		use crate::chain::keysinterface::BaseSign;
+		use crate::chain::keysinterface::EcdsaChannelSigner;
 		use crate::ln::PaymentPreimage;
 		use crate::ln::channel::{HTLCOutputInCommitment ,TxCreationKeys};
 		use crate::ln::chan_utils::{ChannelPublicKeys, HolderCommitmentTransaction, CounterpartyChannelTransactionParameters};
@@ -7322,7 +7452,6 @@ mod tests {
 
 		let mut signer = InMemorySigner::new(
 			&secp_ctx,
-			SecretKey::from_slice(&hex::decode("4242424242424242424242424242424242424242424242424242424242424242").unwrap()[..]).unwrap(),
 			SecretKey::from_slice(&hex::decode("30ff4956bbdd3222d44cc5e8a1261dab1e07957bdac5ae88fe3261ef321f3749").unwrap()[..]).unwrap(),
 			SecretKey::from_slice(&hex::decode("0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").unwrap()[..]).unwrap(),
 			SecretKey::from_slice(&hex::decode("1111111111111111111111111111111111111111111111111111111111111111").unwrap()[..]).unwrap(),
@@ -7342,7 +7471,7 @@ mod tests {
 		let counterparty_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let mut config = UserConfig::default();
 		config.channel_handshake_config.announced_channel = false;
-		let mut chan = Channel::<InMemorySigner>::new_outbound(&LowerBoundedFeeEstimator::new(&feeest), &&keys_provider, counterparty_node_id, &channelmanager::provided_init_features(), 10_000_000, 100000, 42, &config, 0, 42).unwrap(); // Nothing uses their network key in this test
+		let mut chan = Channel::<InMemorySigner>::new_outbound(&LowerBoundedFeeEstimator::new(&feeest), &&keys_provider, &&keys_provider, counterparty_node_id, &channelmanager::provided_init_features(&config), 10_000_000, 0, 42, &config, 0, 42).unwrap(); // Nothing uses their network key in this test
 		chan.holder_dust_limit_satoshis = 546;
 		chan.counterparty_selected_channel_reserve_satoshis = Some(0); // Filled in in accept_channel
 
@@ -7484,6 +7613,11 @@ mod tests {
 				assert!(htlc_sig_iter.next().is_none());
 			} }
 		}
+
+		// anchors: simple commitment tx with no HTLCs and single anchor
+		test_commitment_with_anchors!("30440220655bf909fb6fa81d086f1336ac72c97906dce29d1b166e305c99152d810e26e1022051f577faa46412c46707aaac46b65d50053550a66334e00a44af2706f27a8658",
+						 "3044022007cf6b405e9c9b4f527b0ecad9d8bb661fabb8b12abf7d1c0b3ad1855db3ed490220616d5c1eeadccc63bd775a131149455d62d95a42c2a1b01cc7821fc42dce7778",
+						 "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b80024a010000000000002200202b1b5854183c12d3316565972c4668929d314d81c5dcdbb21cb45fe8a9a8114f10529800000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0400473044022007cf6b405e9c9b4f527b0ecad9d8bb661fabb8b12abf7d1c0b3ad1855db3ed490220616d5c1eeadccc63bd775a131149455d62d95a42c2a1b01cc7821fc42dce7778014730440220655bf909fb6fa81d086f1336ac72c97906dce29d1b166e305c99152d810e26e1022051f577faa46412c46707aaac46b65d50053550a66334e00a44af2706f27a865801475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220", {});
 
 		// simple commitment tx with no HTLCs
 		chan.value_to_self_msat = 7000000000;
@@ -7935,7 +8069,7 @@ mod tests {
 		chan.pending_outbound_htlcs.push({
 			let mut out = OutboundHTLCOutput{
 				htlc_id: 6,
-				amount_msat: 5000000,
+				amount_msat: 5000001,
 				cltv_expiry: 506,
 				payment_hash: PaymentHash([0; 32]),
 				state: OutboundHTLCState::Committed,
@@ -7957,40 +8091,40 @@ mod tests {
 			out
 		});
 
-		test_commitment!("30440220048705bec5288d28b3f29344b8d124853b1af423a568664d2c6f02c8ea886525022060f998a461052a2476b912db426ea2a06700953a241135c7957f2e79bc222df9",
-		                 "3045022100c4f1d60b6fca9febc8b39de1a31e84c5f7c4b41c97239ef05f4350aa484c6b5e02200c5134ac8b20eb7a29d0dd4a501f6aa8fefb8489171f4cb408bd2a32324ab03f",
-		                 "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b8005d007000000000000220020748eba944fedc8827f6b06bc44678f93c0f9e6078b35c6331ed31e75f8ce0c2d8813000000000000220020305c12e1a0bc21e283c131cea1c66d68857d28b7b2fce0a6fbc40c164852121b8813000000000000220020305c12e1a0bc21e283c131cea1c66d68857d28b7b2fce0a6fbc40c164852121bc0c62d0000000000160014cc1b07838e387deacd0e5232e1e8b49f4c29e484a79f6a00000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0400483045022100c4f1d60b6fca9febc8b39de1a31e84c5f7c4b41c97239ef05f4350aa484c6b5e02200c5134ac8b20eb7a29d0dd4a501f6aa8fefb8489171f4cb408bd2a32324ab03f014730440220048705bec5288d28b3f29344b8d124853b1af423a568664d2c6f02c8ea886525022060f998a461052a2476b912db426ea2a06700953a241135c7957f2e79bc222df901475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220", {
+		test_commitment!("304402207d0870964530f97b62497b11153c551dca0a1e226815ef0a336651158da0f82402200f5378beee0e77759147b8a0a284decd11bfd2bc55c8fafa41c134fe996d43c8",
+		                 "304402200d10bf5bc5397fc59d7188ae438d80c77575595a2d488e41bd6363a810cc8d72022012b57e714fbbfdf7a28c47d5b370cb8ac37c8545f596216e5b21e9b236ef457c",
+		                 "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b8005d007000000000000220020748eba944fedc8827f6b06bc44678f93c0f9e6078b35c6331ed31e75f8ce0c2d8813000000000000220020305c12e1a0bc21e283c131cea1c66d68857d28b7b2fce0a6fbc40c164852121b8813000000000000220020305c12e1a0bc21e283c131cea1c66d68857d28b7b2fce0a6fbc40c164852121bc0c62d0000000000160014cc1b07838e387deacd0e5232e1e8b49f4c29e484a69f6a00000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e040047304402200d10bf5bc5397fc59d7188ae438d80c77575595a2d488e41bd6363a810cc8d72022012b57e714fbbfdf7a28c47d5b370cb8ac37c8545f596216e5b21e9b236ef457c0147304402207d0870964530f97b62497b11153c551dca0a1e226815ef0a336651158da0f82402200f5378beee0e77759147b8a0a284decd11bfd2bc55c8fafa41c134fe996d43c801475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220", {
 
 		                  { 0,
-		                  "304502210081cbb94121761d34c189cd4e6a281feea6f585060ad0ba2632e8d6b3c6bb8a6c02201007981bbd16539d63df2805b5568f1f5688cd2a885d04706f50db9b77ba13c6",
-		                  "304502210090ed76aeb21b53236a598968abc66e2024691d07b62f53ddbeca8f93144af9c602205f873af5a0c10e62690e9aba09740550f194a9dc455ba4c1c23f6cde7704674c",
-		                  "0200000000010189a326e23addc28323dbadcb4e71c2c17088b6e8fa184103e552f44075dddc34000000000000000000011f070000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e050048304502210081cbb94121761d34c189cd4e6a281feea6f585060ad0ba2632e8d6b3c6bb8a6c02201007981bbd16539d63df2805b5568f1f5688cd2a885d04706f50db9b77ba13c60148304502210090ed76aeb21b53236a598968abc66e2024691d07b62f53ddbeca8f93144af9c602205f873af5a0c10e62690e9aba09740550f194a9dc455ba4c1c23f6cde7704674c012001010101010101010101010101010101010101010101010101010101010101018a76a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c8201208763a9144b6b2e5444c2639cc0fb7bcea5afba3f3cdce23988527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae677502f501b175ac686800000000" },
+		                  "3045022100b470fe12e5b7fea9eccb8cbff1972cea4f96758041898982a02bcc7f9d56d50b0220338a75b2afaab4ec00cdd2d9273c68c7581ff5a28bcbb40c4d138b81f1d45ce5",
+		                  "3044022017b90c65207522a907fb6a137f9dd528b3389465a8ae72308d9e1d564f512cf402204fc917b4f0e88604a3e994f85bfae7c7c1f9d9e9f78e8cd112e0889720d9405b",
+		                  "020000000001014bdccf28653066a2c554cafeffdfe1e678e64a69b056684deb0c4fba909423ec000000000000000000011f070000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100b470fe12e5b7fea9eccb8cbff1972cea4f96758041898982a02bcc7f9d56d50b0220338a75b2afaab4ec00cdd2d9273c68c7581ff5a28bcbb40c4d138b81f1d45ce501473044022017b90c65207522a907fb6a137f9dd528b3389465a8ae72308d9e1d564f512cf402204fc917b4f0e88604a3e994f85bfae7c7c1f9d9e9f78e8cd112e0889720d9405b012001010101010101010101010101010101010101010101010101010101010101018a76a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c8201208763a9144b6b2e5444c2639cc0fb7bcea5afba3f3cdce23988527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae677502f501b175ac686800000000" },
 		                  { 1,
-		                  "304402201d0f09d2bf7bc245a4f17980e1e9164290df16c70c6a2ff1592f5030d6108581022061e744a7dc151b36bf0aff7a4f1812ba90b8b03633bb979a270d19858fd960c5",
-		                  "30450221009aef000d2e843a4202c1b1a2bf554abc9a7902bf49b2cb0759bc507456b7ebad02204e7c3d193ede2fd2b4cd6b39f51a920e581e35575e357e44d7b699c40ce61d39",
-		                  "0200000000010189a326e23addc28323dbadcb4e71c2c17088b6e8fa184103e552f44075dddc3401000000000000000001e1120000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e050047304402201d0f09d2bf7bc245a4f17980e1e9164290df16c70c6a2ff1592f5030d6108581022061e744a7dc151b36bf0aff7a4f1812ba90b8b03633bb979a270d19858fd960c5014830450221009aef000d2e843a4202c1b1a2bf554abc9a7902bf49b2cb0759bc507456b7ebad02204e7c3d193ede2fd2b4cd6b39f51a920e581e35575e357e44d7b699c40ce61d3901008576a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6868f9010000" },
+		                  "3045022100b575379f6d8743cb0087648f81cfd82d17a97fbf8f67e058c65ce8b9d25df9500220554a210d65b02d9f36c6adf0f639430ca8293196ba5089bf67cc3a9813b7b00a",
+		                  "3045022100ee2e16b90930a479b13f8823a7f14b600198c838161160b9436ed086d3fc57e002202a66fa2324f342a17129949c640bfe934cbc73a869ba7c06aa25c5a3d0bfb53d",
+		                  "020000000001014bdccf28653066a2c554cafeffdfe1e678e64a69b056684deb0c4fba909423ec01000000000000000001e1120000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100b575379f6d8743cb0087648f81cfd82d17a97fbf8f67e058c65ce8b9d25df9500220554a210d65b02d9f36c6adf0f639430ca8293196ba5089bf67cc3a9813b7b00a01483045022100ee2e16b90930a479b13f8823a7f14b600198c838161160b9436ed086d3fc57e002202a66fa2324f342a17129949c640bfe934cbc73a869ba7c06aa25c5a3d0bfb53d01008576a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6868f9010000" },
 		                  { 2,
-		                  "30440220010bf035d5823596e50dce2076a4d9f942d8d28031c9c428b901a02b6b8140de02203250e8e4a08bc5b4ecdca4d0eedf98223e02e3ac1c0206b3a7ffdb374aa21e5f",
-		                  "30440220073de0067b88e425b3018b30366bfeda0ccb703118ccd3d02ead08c0f53511d002203fac50ac0e4cf8a3af0b4b1b12e801650591f748f8ddf1e089c160f10b69e511",
-		                  "0200000000010189a326e23addc28323dbadcb4e71c2c17088b6e8fa184103e552f44075dddc3402000000000000000001e1120000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e05004730440220010bf035d5823596e50dce2076a4d9f942d8d28031c9c428b901a02b6b8140de02203250e8e4a08bc5b4ecdca4d0eedf98223e02e3ac1c0206b3a7ffdb374aa21e5f014730440220073de0067b88e425b3018b30366bfeda0ccb703118ccd3d02ead08c0f53511d002203fac50ac0e4cf8a3af0b4b1b12e801650591f748f8ddf1e089c160f10b69e51101008576a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6868fa010000" }
+		                  "30440220471c9f3ad92e49b13b7b8059f43ecf8f7887b0dccbb9fdb54bfe23d62a8ae332022024bd22fae0740e86a44228c35330da9526fd7306dffb2b9dc362d5e78abef7cc",
+		                  "304402207157f452f2506d73c315192311893800cfb3cc235cc1185b1cfcc136b55230db022014be242dbc6c5da141fec4034e7f387f74d6ff1899453d72ba957467540e1ecb",
+		                  "020000000001014bdccf28653066a2c554cafeffdfe1e678e64a69b056684deb0c4fba909423ec02000000000000000001e1120000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e05004730440220471c9f3ad92e49b13b7b8059f43ecf8f7887b0dccbb9fdb54bfe23d62a8ae332022024bd22fae0740e86a44228c35330da9526fd7306dffb2b9dc362d5e78abef7cc0147304402207157f452f2506d73c315192311893800cfb3cc235cc1185b1cfcc136b55230db022014be242dbc6c5da141fec4034e7f387f74d6ff1899453d72ba957467540e1ecb01008576a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6868fa010000" }
 		} );
 
-		test_commitment_with_anchors!("3045022100c592f6b80d35b4f5d1e3bc9788f51141a0065be6013bad53a1977f7c444651660220278ac06ead9016bfb8dc476f186eabace2b02793b2f308442f5b0d5f24a68948",
-		                 "3045022100c37ac4fc8538677631230c4b286f36b6f54c51fb4b34ef0bd0ba219ba47452630220278e09a745454ea380f3694392ed113762c68dd209b48360f547541088be9e45",
-		                 "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b80074a010000000000002200202b1b5854183c12d3316565972c4668929d314d81c5dcdbb21cb45fe8a9a8114f4a01000000000000220020e9e86e4823faa62e222ebc858a226636856158f07e69898da3b0d1af0ddb3994d007000000000000220020fe0598d74fee2205cc3672e6e6647706b4f3099713b4661b62482c3addd04a5e881300000000000022002018e40f9072c44350f134bdc887bab4d9bdfc8aa468a25616c80e21757ba5dac7881300000000000022002018e40f9072c44350f134bdc887bab4d9bdfc8aa468a25616c80e21757ba5dac7c0c62d0000000000220020f3394e1e619b0eca1f91be2fb5ab4dfc59ba5b84ebe014ad1d43a564d012994aae9c6a00000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0400483045022100c37ac4fc8538677631230c4b286f36b6f54c51fb4b34ef0bd0ba219ba47452630220278e09a745454ea380f3694392ed113762c68dd209b48360f547541088be9e4501483045022100c592f6b80d35b4f5d1e3bc9788f51141a0065be6013bad53a1977f7c444651660220278ac06ead9016bfb8dc476f186eabace2b02793b2f308442f5b0d5f24a6894801475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220", {
+		test_commitment_with_anchors!("3044022027b38dfb654c34032ffb70bb43022981652fce923cbbe3cbe7394e2ade8b34230220584195b78da6e25c2e8da6b4308d9db25b65b64975db9266163ef592abb7c725",
+		                 "3045022100b4014970d9d7962853f3f85196144671d7d5d87426250f0a5fdaf9a55292e92502205360910c9abb397467e19dbd63d081deb4a3240903114c98cec0a23591b79b76",
+		                 "02000000000101bef67e4e2fb9ddeeb3461973cd4c62abb35050b1add772995b820b584a488489000000000038b02b80074a010000000000002200202b1b5854183c12d3316565972c4668929d314d81c5dcdbb21cb45fe8a9a8114f4a01000000000000220020e9e86e4823faa62e222ebc858a226636856158f07e69898da3b0d1af0ddb3994d007000000000000220020fe0598d74fee2205cc3672e6e6647706b4f3099713b4661b62482c3addd04a5e881300000000000022002018e40f9072c44350f134bdc887bab4d9bdfc8aa468a25616c80e21757ba5dac7881300000000000022002018e40f9072c44350f134bdc887bab4d9bdfc8aa468a25616c80e21757ba5dac7c0c62d0000000000220020f3394e1e619b0eca1f91be2fb5ab4dfc59ba5b84ebe014ad1d43a564d012994aad9c6a00000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0400483045022100b4014970d9d7962853f3f85196144671d7d5d87426250f0a5fdaf9a55292e92502205360910c9abb397467e19dbd63d081deb4a3240903114c98cec0a23591b79b7601473044022027b38dfb654c34032ffb70bb43022981652fce923cbbe3cbe7394e2ade8b34230220584195b78da6e25c2e8da6b4308d9db25b65b64975db9266163ef592abb7c72501475221023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb21030e9f7b623d2ccc7c9bd44d66d5ce21ce504c0acf6385a132cec6d3c39fa711c152ae3e195220", {
 
 		                  { 0,
-		                  "3045022100de8a0649d54fd2e4fc04502c77df9b65da839bbd01854f818f129338b99564b2022009528dbb12c00e874cb2149b1dccc600c69ea5e4042ebf584984fcb029c2d1ec",
-		                  "304402203e7c2622fa3ca29355d37a0ea991bfd7cdb54e6122a1d98d3229d092131f55cd022055263f7f8f32f4cd2f86da63ca106bd7badf0b19ee9833d80cd3b9216eeafd74",
-		                  "02000000000101aa443fb63abc1e8c754f98a7b96c27cb02b21d891d1242a16b630dc32c2afe2902000000000100000001d0070000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100de8a0649d54fd2e4fc04502c77df9b65da839bbd01854f818f129338b99564b2022009528dbb12c00e874cb2149b1dccc600c69ea5e4042ebf584984fcb029c2d1ec8347304402203e7c2622fa3ca29355d37a0ea991bfd7cdb54e6122a1d98d3229d092131f55cd022055263f7f8f32f4cd2f86da63ca106bd7badf0b19ee9833d80cd3b9216eeafd74012001010101010101010101010101010101010101010101010101010101010101018d76a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c8201208763a9144b6b2e5444c2639cc0fb7bcea5afba3f3cdce23988527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae677502f501b175ac6851b2756800000000" },
+		                  "30440220078fe5343dab88c348a3a8a9c1a9293259dbf35507ae971702cc39dd623ea9af022011ed0c0f35243cd0bb4d9ca3c772379b2b5f4af93140e9fdc5600dfec1cdb0c2",
+		                  "304402205df665e2908c7690d2d33eb70e6e119958c28febe141a94ed0dd9a55ce7c8cfc0220364d02663a5d019af35c5cd5fda9465d985d85bbd12db207738d61163449a424",
+		                  "020000000001013d060d0305c9616eaabc21d41fae85bcb5477b5d7f1c92aa429cf15339bbe1c402000000000100000001d0070000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e05004730440220078fe5343dab88c348a3a8a9c1a9293259dbf35507ae971702cc39dd623ea9af022011ed0c0f35243cd0bb4d9ca3c772379b2b5f4af93140e9fdc5600dfec1cdb0c28347304402205df665e2908c7690d2d33eb70e6e119958c28febe141a94ed0dd9a55ce7c8cfc0220364d02663a5d019af35c5cd5fda9465d985d85bbd12db207738d61163449a424012001010101010101010101010101010101010101010101010101010101010101018d76a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c8201208763a9144b6b2e5444c2639cc0fb7bcea5afba3f3cdce23988527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae677502f501b175ac6851b2756800000000" },
 		                  { 1,
-		                  "3045022100de6eee8474376ea316d007b33103b4543a46bdf6fda5cbd5902b28a5bc14584f022002989e7b4f7813b77acbe4babcf96d7ffbbe0bf14cba24672364f8e591479edb",
-		                  "3045022100c10688346a9d84647bde7027da07f0d79c6d4129307e4c6c9aea7bdbf25ac3350220269104209793c32c47491698c4e46ebea9c3293a1e4403f9abda39f79698f6b5",
-		                  "02000000000101aa443fb63abc1e8c754f98a7b96c27cb02b21d891d1242a16b630dc32c2afe290300000000010000000188130000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100de6eee8474376ea316d007b33103b4543a46bdf6fda5cbd5902b28a5bc14584f022002989e7b4f7813b77acbe4babcf96d7ffbbe0bf14cba24672364f8e591479edb83483045022100c10688346a9d84647bde7027da07f0d79c6d4129307e4c6c9aea7bdbf25ac3350220269104209793c32c47491698c4e46ebea9c3293a1e4403f9abda39f79698f6b501008876a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6851b27568f9010000" },
+		                  "304402202df6bf0f98a42cfd0172a16bded7d1b16c14f5f42ba23f5c54648c14b647531302200fe1508626817f23925bb56951d5e4b2654c751743ab6db48a6cce7dda17c01c",
+		                  "304402203f99ec05cdd89558a23683b471c1dcce8f6a92295f1fff3b0b5d21be4d4f97ea022019d29070690fc2c126fe27cc4ab2f503f289d362721b2efa7418e7fddb939a5b",
+		                  "020000000001013d060d0305c9616eaabc21d41fae85bcb5477b5d7f1c92aa429cf15339bbe1c40300000000010000000188130000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e050047304402202df6bf0f98a42cfd0172a16bded7d1b16c14f5f42ba23f5c54648c14b647531302200fe1508626817f23925bb56951d5e4b2654c751743ab6db48a6cce7dda17c01c8347304402203f99ec05cdd89558a23683b471c1dcce8f6a92295f1fff3b0b5d21be4d4f97ea022019d29070690fc2c126fe27cc4ab2f503f289d362721b2efa7418e7fddb939a5b01008876a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6851b27568f9010000" },
 		                  { 2,
-		                  "3045022100fe87da8124ceecbcabb9d599c5339f40277c7c7406514fafbccbf180c7c09cf40220429c7fb6d0fd3705e931ab1219ab0432af38ae4d676008cc1964fbeb8cd35d2e",
-		                  "3044022040ac769a851da31d8e4863e5f94719204f716c82a1ce6d6c52193d9a33b84bce022035df97b078ce80f20dca2109e4c6075af0b50148811452e7290e68b2680fced4",
-		                  "02000000000101aa443fb63abc1e8c754f98a7b96c27cb02b21d891d1242a16b630dc32c2afe290400000000010000000188130000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100fe87da8124ceecbcabb9d599c5339f40277c7c7406514fafbccbf180c7c09cf40220429c7fb6d0fd3705e931ab1219ab0432af38ae4d676008cc1964fbeb8cd35d2e83473044022040ac769a851da31d8e4863e5f94719204f716c82a1ce6d6c52193d9a33b84bce022035df97b078ce80f20dca2109e4c6075af0b50148811452e7290e68b2680fced401008876a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6851b27568fa010000" }
+		                  "3045022100bd206b420c495f3aa714d3ea4766cbe95441deacb5d2f737f1913349aee7c2ae02200249d2c950dd3b15326bf378ae5d2b871d33d6737f5d70735f3de8383140f2a1",
+		                  "3045022100f2cd35e385b9b7e15b92a5d78d120b6b2c5af4e974bc01e884c5facb3bb5966c0220706e0506477ce809a40022d6de8e041e9ef13136c45abee9c36f58a01fdb188b",
+		                  "020000000001013d060d0305c9616eaabc21d41fae85bcb5477b5d7f1c92aa429cf15339bbe1c40400000000010000000188130000000000002200204adb4e2f00643db396dd120d4e7dc17625f5f2c11a40d857accc862d6b7dd80e0500483045022100bd206b420c495f3aa714d3ea4766cbe95441deacb5d2f737f1913349aee7c2ae02200249d2c950dd3b15326bf378ae5d2b871d33d6737f5d70735f3de8383140f2a183483045022100f2cd35e385b9b7e15b92a5d78d120b6b2c5af4e974bc01e884c5facb3bb5966c0220706e0506477ce809a40022d6de8e041e9ef13136c45abee9c36f58a01fdb188b01008876a91414011f7254d96b819c76986c277d115efce6f7b58763ac67210394854aa6eab5b2a8122cc726e9dded053a2184d88256816826d6231c068d4a5b7c820120876475527c21030d417a46946384f88d5f3337267c5e579765875dc4daca813e21734b140639e752ae67a9142002cc93ebefbb1b73f0af055dcc27a0b504ad7688ac6851b27568fa010000" }
 		} );
 	}
 
@@ -8056,8 +8190,8 @@ mod tests {
 
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
 		let config = UserConfig::default();
-		let node_a_chan = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider,
-			node_b_node_id, &channelmanager::provided_init_features(), 10000000, 100000, 42, &config, 0, 42).unwrap();
+		let node_a_chan = Channel::<EnforcingSigner>::new_outbound(&feeest, &&keys_provider, &&keys_provider,
+			node_b_node_id, &channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42).unwrap();
 
 		let mut channel_type_features = ChannelTypeFeatures::only_static_remote_key();
 		channel_type_features.set_zero_conf_required();
@@ -8065,8 +8199,165 @@ mod tests {
 		let mut open_channel_msg = node_a_chan.get_open_channel(genesis_block(network).header.block_hash());
 		open_channel_msg.channel_type = Some(channel_type_features);
 		let node_b_node_id = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[7; 32]).unwrap());
-		let res = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider,
-			node_b_node_id, &channelmanager::provided_init_features(), &open_channel_msg, 7, &config, 0, &&logger, 42);
+		let res = Channel::<EnforcingSigner>::new_from_req(&feeest, &&keys_provider, &&keys_provider,
+			node_b_node_id, &channelmanager::provided_channel_type_features(&config),
+			&channelmanager::provided_init_features(&config), &open_channel_msg, 7, &config, 0, &&logger, 42);
 		assert!(res.is_ok());
+	}
+
+	#[cfg(anchors)]
+	#[test]
+	fn test_supports_anchors_zero_htlc_tx_fee() {
+		// Tests that if both sides support and negotiate `anchors_zero_fee_htlc_tx`, it is the
+		// resulting `channel_type`.
+		let secp_ctx = Secp256k1::new();
+		let fee_estimator = LowerBoundedFeeEstimator::new(&TestFeeEstimator{fee_est: 15000});
+		let network = Network::Testnet;
+		let keys_provider = test_utils::TestKeysInterface::new(&[42; 32], network);
+		let logger = test_utils::TestLogger::new();
+
+		let node_id_a = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[1; 32]).unwrap());
+		let node_id_b = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[2; 32]).unwrap());
+
+		let mut config = UserConfig::default();
+		config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+
+		// It is not enough for just the initiator to signal `option_anchors_zero_fee_htlc_tx`, both
+		// need to signal it.
+		let channel_a = Channel::<EnforcingSigner>::new_outbound(
+			&fee_estimator, &&keys_provider, &&keys_provider, node_id_b,
+			&channelmanager::provided_init_features(&UserConfig::default()), 10000000, 100000, 42,
+			&config, 0, 42
+		).unwrap();
+		assert!(!channel_a.channel_type.supports_anchors_zero_fee_htlc_tx());
+
+		let mut expected_channel_type = ChannelTypeFeatures::empty();
+		expected_channel_type.set_static_remote_key_required();
+		expected_channel_type.set_anchors_zero_fee_htlc_tx_required();
+
+		let channel_a = Channel::<EnforcingSigner>::new_outbound(
+			&fee_estimator, &&keys_provider, &&keys_provider, node_id_b,
+			&channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42
+		).unwrap();
+
+		let open_channel_msg = channel_a.get_open_channel(genesis_block(network).header.block_hash());
+		let channel_b = Channel::<EnforcingSigner>::new_from_req(
+			&fee_estimator, &&keys_provider, &&keys_provider, node_id_a,
+			&channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config),
+			&open_channel_msg, 7, &config, 0, &&logger, 42
+		).unwrap();
+
+		assert_eq!(channel_a.channel_type, expected_channel_type);
+		assert_eq!(channel_b.channel_type, expected_channel_type);
+	}
+
+	#[cfg(anchors)]
+	#[test]
+	fn test_rejects_implicit_simple_anchors() {
+		// Tests that if `option_anchors` is being negotiated implicitly through the intersection of
+		// each side's `InitFeatures`, it is rejected.
+		let secp_ctx = Secp256k1::new();
+		let fee_estimator = LowerBoundedFeeEstimator::new(&TestFeeEstimator{fee_est: 15000});
+		let network = Network::Testnet;
+		let keys_provider = test_utils::TestKeysInterface::new(&[42; 32], network);
+		let logger = test_utils::TestLogger::new();
+
+		let node_id_a = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[1; 32]).unwrap());
+		let node_id_b = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[2; 32]).unwrap());
+
+		let config = UserConfig::default();
+
+		// See feature bit assignments: https://github.com/lightning/bolts/blob/master/09-features.md
+		let static_remote_key_required: u64 = 1 << 12;
+		let simple_anchors_required: u64 = 1 << 20;
+		let raw_init_features = static_remote_key_required | simple_anchors_required;
+		let init_features_with_simple_anchors = InitFeatures::from_le_bytes(raw_init_features.to_le_bytes().to_vec());
+
+		let channel_a = Channel::<EnforcingSigner>::new_outbound(
+			&fee_estimator, &&keys_provider, &&keys_provider, node_id_b,
+			&channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42
+		).unwrap();
+
+		// Set `channel_type` to `None` to force the implicit feature negotiation.
+		let mut open_channel_msg = channel_a.get_open_channel(genesis_block(network).header.block_hash());
+		open_channel_msg.channel_type = None;
+
+		// Since A supports both `static_remote_key` and `option_anchors`, but B only accepts
+		// `static_remote_key`, it will fail the channel.
+		let channel_b = Channel::<EnforcingSigner>::new_from_req(
+			&fee_estimator, &&keys_provider, &&keys_provider, node_id_a,
+			&channelmanager::provided_channel_type_features(&config), &init_features_with_simple_anchors,
+			&open_channel_msg, 7, &config, 0, &&logger, 42
+		);
+		assert!(channel_b.is_err());
+	}
+
+	#[cfg(anchors)]
+	#[test]
+	fn test_rejects_simple_anchors_channel_type() {
+		// Tests that if `option_anchors` is being negotiated through the `channel_type` feature,
+		// it is rejected.
+		let secp_ctx = Secp256k1::new();
+		let fee_estimator = LowerBoundedFeeEstimator::new(&TestFeeEstimator{fee_est: 15000});
+		let network = Network::Testnet;
+		let keys_provider = test_utils::TestKeysInterface::new(&[42; 32], network);
+		let logger = test_utils::TestLogger::new();
+
+		let node_id_a = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[1; 32]).unwrap());
+		let node_id_b = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[2; 32]).unwrap());
+
+		let config = UserConfig::default();
+
+		// See feature bit assignments: https://github.com/lightning/bolts/blob/master/09-features.md
+		let static_remote_key_required: u64 = 1 << 12;
+		let simple_anchors_required: u64 = 1 << 20;
+		let simple_anchors_raw_features = static_remote_key_required | simple_anchors_required;
+		let simple_anchors_init = InitFeatures::from_le_bytes(simple_anchors_raw_features.to_le_bytes().to_vec());
+		let simple_anchors_channel_type = ChannelTypeFeatures::from_le_bytes(simple_anchors_raw_features.to_le_bytes().to_vec());
+		assert!(simple_anchors_init.requires_unknown_bits());
+		assert!(simple_anchors_channel_type.requires_unknown_bits());
+
+		// First, we'll try to open a channel between A and B where A requests a channel type for
+		// the original `option_anchors` feature (non zero fee htlc tx). This should be rejected by
+		// B as it's not supported by LDK.
+		let channel_a = Channel::<EnforcingSigner>::new_outbound(
+			&fee_estimator, &&keys_provider, &&keys_provider, node_id_b,
+			&channelmanager::provided_init_features(&config), 10000000, 100000, 42, &config, 0, 42
+		).unwrap();
+
+		let mut open_channel_msg = channel_a.get_open_channel(genesis_block(network).header.block_hash());
+		open_channel_msg.channel_type = Some(simple_anchors_channel_type.clone());
+
+		let res = Channel::<EnforcingSigner>::new_from_req(
+			&fee_estimator, &&keys_provider, &&keys_provider, node_id_a,
+			&channelmanager::provided_channel_type_features(&config), &simple_anchors_init,
+			&open_channel_msg, 7, &config, 0, &&logger, 42
+		);
+		assert!(res.is_err());
+
+		// Then, we'll try to open another channel where A requests a channel type for
+		// `anchors_zero_fee_htlc_tx`. B is malicious and tries to downgrade the channel type to the
+		// original `option_anchors` feature, which should be rejected by A as it's not supported by
+		// LDK.
+		let mut channel_a = Channel::<EnforcingSigner>::new_outbound(
+			&fee_estimator, &&keys_provider, &&keys_provider, node_id_b, &simple_anchors_init,
+			10000000, 100000, 42, &config, 0, 42
+		).unwrap();
+
+		let open_channel_msg = channel_a.get_open_channel(genesis_block(network).header.block_hash());
+
+		let channel_b = Channel::<EnforcingSigner>::new_from_req(
+			&fee_estimator, &&keys_provider, &&keys_provider, node_id_a,
+			&channelmanager::provided_channel_type_features(&config), &channelmanager::provided_init_features(&config),
+			&open_channel_msg, 7, &config, 0, &&logger, 42
+		).unwrap();
+
+		let mut accept_channel_msg = channel_b.get_accept_channel_message();
+		accept_channel_msg.channel_type = Some(simple_anchors_channel_type.clone());
+
+		let res = channel_a.accept_channel(
+			&accept_channel_msg, &config.channel_handshake_limits, &simple_anchors_init
+		);
+		assert!(res.is_err());
 	}
 }

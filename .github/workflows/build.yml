@@ -7,57 +7,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [ ubuntu-latest ]
-        toolchain: [ stable,
-                     beta,
-                     # 1.41.1 is MSRV for Rust-Lightning, lightning-invoice, and lightning-persister
-                     1.41.1,
-                     # 1.45.2 is MSRV for lightning-net-tokio, lightning-block-sync, lightning-background-processor, and coverage generation
-                     1.45.2,
-                     # 1.47.0 will be the MSRV for no-std builds using hashbrown once core2 is updated
-                     1.47.0]
+        platform: [ ubuntu-latest, windows-latest, macos-latest ]
+        toolchain: [ stable, beta ]
         include:
           - toolchain: stable
-            build-net-tokio: true
-            build-no-std: true
-            build-futures: true
-          - toolchain: stable
-            platform: macos-latest
-            build-net-tokio: true
-            build-no-std: true
-            build-futures: true
-          - toolchain: beta
-            platform: macos-latest
-            build-net-tokio: true
-            build-no-std: true
-            build-futures: true
-          - toolchain: stable
-            platform: windows-latest
-            build-net-tokio: true
-            build-no-std: true
-            build-futures: true
-          - toolchain: beta
-            platform: windows-latest
-            build-net-tokio: true
-            build-no-std: true
-            build-futures: true
-          - toolchain: beta
-            build-net-tokio: true
-            build-no-std: true
-            build-futures: true
-          - toolchain: 1.41.1
-            build-no-std: false
-            test-log-variants: true
-            build-futures: false
-          - toolchain: 1.45.2
-            build-net-old-tokio: true
-            build-net-tokio: true
-            build-no-std: false
-            build-futures: true
+            platform: ubuntu-latest
             coverage: true
-          - toolchain: 1.47.0
-            build-futures: true
-            build-no-std: true
+          # 1.48.0 is the MSRV for all crates except lightning-transaction-sync and Win/Mac
+          - toolchain: 1.48.0
+            platform: ubuntu-latest
+          # Windows requires 1.49.0 because that's the MSRV for supported Tokio
+          - toolchain: 1.49.0
+            platform: windows-latest
+          # MacOS-latest requires 1.54.0 because that's what's required for linking to work properly
+          - toolchain: 1.54.0
+            platform: macos-latest
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout source code
@@ -68,41 +32,10 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           override: true
           profile: minimal
-      - name: Pin tokio to 1.14 for Rust 1.45
-        if: "matrix.build-net-old-tokio"
-        run: cargo update -p tokio --precise "1.14.0" --verbose
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      - name: Build on Rust ${{ matrix.toolchain }} with net-tokio
-        if: "matrix.build-net-tokio && !matrix.coverage"
-        run: cargo build --verbose --color always
-      - name: Build on Rust ${{ matrix.toolchain }} with net-tokio and full code-linking for coverage generation
-        if: matrix.coverage
-        run: RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always
-      - name: Build on Rust ${{ matrix.toolchain }}
-        if: "! matrix.build-net-tokio"
+      - name: Install no-std-check dependencies for ARM Embedded
+        if: "matrix.platform == 'ubuntu-latest'"
         run: |
-          cargo build --verbose  --color always -p lightning
-          cargo build --verbose  --color always -p lightning-invoice
-          cargo build --verbose  --color always -p lightning-persister
-      - name: Build on Rust ${{ matrix.toolchain }} with all Log-Limiting features
-        if: matrix.test-log-variants
-        run: |
-          cd lightning
-          for FEATURE in $(cat Cargo.toml | grep '^max_level_' | awk '{ print $1 }'); do
-            cargo build --verbose --color always --features $FEATURE
-          done
-      - name: Build Block Sync Clients on Rust ${{ matrix.toolchain }} with features
-        if: "matrix.build-net-tokio && !matrix.coverage"
-        run: |
-          cd lightning-block-sync
-          cargo build --verbose --color always --features rest-client
-          cargo build --verbose --color always --features rpc-client
-          cargo build --verbose --color always --features rpc-client,rest-client
-          cargo build --verbose --color always --features rpc-client,rest-client,tokio
-      - name: Build Block Sync Clients on Rust ${{ matrix.toolchain }} with features and full code-linking for coverage generation
-        if: matrix.coverage
-        run: |
+<<<<<<< HEAD
           cd lightning-block-sync
           RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rest-client
           RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rpc-client
@@ -141,57 +74,23 @@ jobs:
         if: "matrix.build-no-std && matrix.platform == 'ubuntu-latest'"
         run: |
           cd no-std-check
+=======
+>>>>>>> 3d479c9de62665214e8589699cdbb8a797b77188
           rustup target add thumbv7m-none-eabi
           sudo apt-get -y install gcc-arm-none-eabi
-          cargo build --target=thumbv7m-none-eabi
-      - name: Test on no-std builds Rust ${{ matrix.toolchain }} and full code-linking for coverage generation
-        if: "matrix.build-no-std && matrix.coverage"
+      - name: shellcheck the CI script
+        if: "matrix.platform == 'ubuntu-latest'"
         run: |
-          cd lightning
-          RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --no-default-features --features no-std
-      - name: Test futures builds on Rust ${{ matrix.toolchain }}
-        if: "matrix.build-futures && !matrix.coverage"
-        shell: bash # Default on Winblows is powershell
-        run: |
-          cd lightning-background-processor
-          cargo test --verbose --color always --no-default-features --features futures
-      - name: Test futures builds on Rust ${{ matrix.toolchain }} and full code-linking for coverage generation
-        if: "matrix.build-futures && matrix.coverage"
-        shell: bash # Default on Winblows is powershell
-        run: |
-          cd lightning-background-processor
-          RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --no-default-features --features futures
-      - name: Test on Rust ${{ matrix.toolchain }}
-        if: "! matrix.build-net-tokio"
-        run: |
-          cargo test --verbose --color always -p lightning
-          cargo test --verbose --color always -p lightning-invoice
-          cargo test --verbose --color always -p lightning-rapid-gossip-sync
-          cargo test --verbose --color always -p lightning-persister
-          cargo test --verbose --color always -p lightning-background-processor
-      - name: Test C Bindings Modifications on Rust ${{ matrix.toolchain }}
-        if: "! matrix.build-net-tokio"
-        run: |
-          RUSTFLAGS="--cfg=c_bindings" cargo test --verbose --color always  -p lightning
-          RUSTFLAGS="--cfg=c_bindings" cargo test --verbose --color always  -p lightning-invoice
-          RUSTFLAGS="--cfg=c_bindings" cargo build --verbose  --color always -p lightning-persister
-          RUSTFLAGS="--cfg=c_bindings" cargo build --verbose  --color always -p lightning-background-processor
-      - name: Test Block Sync Clients on Rust ${{ matrix.toolchain }} with features
-        if: "matrix.build-net-tokio && !matrix.coverage"
-        run: |
-          cd lightning-block-sync
-          cargo test --verbose --color always --features rest-client
-          cargo test --verbose --color always --features rpc-client
-          cargo test --verbose --color always --features rpc-client,rest-client
-          cargo test --verbose --color always --features rpc-client,rest-client,tokio
-      - name: Test Block Sync Clients on Rust ${{ matrix.toolchain }} with features and full code-linking for coverage generation
+          sudo apt-get -y install shellcheck
+          shellcheck ci/ci-tests.sh
+      - name: Run CI script with coverage generation
         if: matrix.coverage
-        run: |
-          cd lightning-block-sync
-          RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rest-client
-          RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rpc-client
-          RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rpc-client,rest-client
-          RUSTFLAGS="-C link-dead-code" cargo test --verbose --color always --features rpc-client,rest-client,tokio
+        shell: bash # Default on Winblows is powershell
+        run: LDK_COVERAGE_BUILD=true ./ci/ci-tests.sh
+      - name: Run CI script
+        if: "!matrix.coverage"
+        shell: bash # Default on Winblows is powershell
+        run: ./ci/ci-tests.sh
       - name: Install deps for kcov
         if: matrix.coverage
         run: |
@@ -242,19 +141,19 @@ jobs:
         id: cache-graph
         uses: actions/cache@v3
         with:
-          path: lightning/net_graph-2021-05-31.bin
-          key: ldk-net_graph-v0.0.15-2021-05-31.bin
+          path: lightning/net_graph-2023-01-18.bin
+          key: ldk-net_graph-v0.0.113-2023-01-18.bin
       - name: Fetch routing graph snapshot
         if: steps.cache-graph.outputs.cache-hit != 'true'
         run: |
-          curl --verbose -L -o lightning/net_graph-2021-05-31.bin https://bitcoin.ninja/ldk-net_graph-v0.0.15-2021-05-31.bin
-          echo "Sha sum: $(sha256sum lightning/net_graph-2021-05-31.bin | awk '{ print $1 }')"
-          if [ "$(sha256sum lightning/net_graph-2021-05-31.bin | awk '{ print $1 }')" != "${EXPECTED_ROUTING_GRAPH_SNAPSHOT_SHASUM}" ]; then
+          curl --verbose -L -o lightning/net_graph-2023-01-18.bin https://bitcoin.ninja/ldk-net_graph-v0.0.113-2023-01-18.bin
+          echo "Sha sum: $(sha256sum lightning/net_graph-2023-01-18.bin | awk '{ print $1 }')"
+          if [ "$(sha256sum lightning/net_graph-2023-01-18.bin | awk '{ print $1 }')" != "${EXPECTED_ROUTING_GRAPH_SNAPSHOT_SHASUM}" ]; then
             echo "Bad hash"
             exit 1
           fi
         env:
-          EXPECTED_ROUTING_GRAPH_SNAPSHOT_SHASUM: 05a5361278f68ee2afd086cc04a1f927a63924be451f3221d380533acfacc303
+          EXPECTED_ROUTING_GRAPH_SNAPSHOT_SHASUM: da6066f2bddcddbe7d8a6debbd53545697137b310bbb8c4911bc8c81fc5ff48c
       - name: Fetch rapid graph sync reference input
         run: |
           curl --verbose -L -o lightning-rapid-gossip-sync/res/full_graph.lngossip https://bitcoin.ninja/ldk-compressed_graph-285cb27df79-2022-07-21.bin
@@ -321,6 +220,7 @@ jobs:
           cargo check --no-default-features --features=no-std --release
           cargo check --no-default-features --features=futures --release
           cargo doc --release
+          RUSTDOCFLAGS="--cfg=anchors" cargo doc --release
 
   fuzz:
     runs-on: ubuntu-latest
@@ -349,7 +249,7 @@ jobs:
   linting:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: 1.47.0
+      TOOLCHAIN: stable
     steps:
       - name: Checkout source code
         uses: actions/checkout@v3

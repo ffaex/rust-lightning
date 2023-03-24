@@ -6,7 +6,6 @@ use core::num::ParseIntError;
 use core::str;
 use core::str::FromStr;
 
-use bech32;
 use bech32::{u5, FromBase32};
 
 use bitcoin_hashes::Hash;
@@ -18,11 +17,10 @@ use lightning::routing::router::{RouteHint, RouteHintHop};
 
 use num_traits::{CheckedAdd, CheckedMul};
 
-use secp256k1;
 use secp256k1::ecdsa::{RecoveryId, RecoverableSignature};
 use secp256k1::PublicKey;
 
-use super::{Invoice, Sha256, TaggedField, ExpiryTime, MinFinalCltvExpiry, Fallback, PayeePubKey, InvoiceSignature, PositiveTimestamp,
+use super::{Invoice, Sha256, TaggedField, ExpiryTime, MinFinalCltvExpiryDelta, Fallback, PayeePubKey, InvoiceSignature, PositiveTimestamp,
 	SemanticError, PrivateRoute, ParseError, ParseOrSemanticError, Description, RawTaggedField, Currency, RawHrp, SiPrefix, RawInvoice,
 	constants, SignedRawInvoice, RawDataPart, InvoiceFeatures};
 
@@ -323,9 +321,9 @@ impl FromStr for RawHrp {
 		};
 
 		Ok(RawHrp {
-			currency: currency,
+			currency,
 			raw_amount: amount,
-			si_prefix: si_prefix,
+			si_prefix,
 		})
 	}
 }
@@ -342,7 +340,7 @@ impl FromBase32 for RawDataPart {
 		let tagged = parse_tagged_parts(&data[7..])?;
 
 		Ok(RawDataPart {
-			timestamp: timestamp,
+			timestamp,
 			tagged_fields: tagged,
 		})
 	}
@@ -451,8 +449,8 @@ impl FromBase32 for TaggedField {
 				Ok(TaggedField::DescriptionHash(Sha256::from_base32(field_data)?)),
 			constants::TAG_EXPIRY_TIME =>
 				Ok(TaggedField::ExpiryTime(ExpiryTime::from_base32(field_data)?)),
-			constants::TAG_MIN_FINAL_CLTV_EXPIRY =>
-				Ok(TaggedField::MinFinalCltvExpiry(MinFinalCltvExpiry::from_base32(field_data)?)),
+			constants::TAG_MIN_FINAL_CLTV_EXPIRY_DELTA =>
+				Ok(TaggedField::MinFinalCltvExpiryDelta(MinFinalCltvExpiryDelta::from_base32(field_data)?)),
 			constants::TAG_FALLBACK =>
 				Ok(TaggedField::Fallback(Fallback::from_base32(field_data)?)),
 			constants::TAG_PRIVATE_ROUTE =>
@@ -515,7 +513,7 @@ impl FromBase32 for ExpiryTime {
 
 	fn from_base32(field_data: &[u5]) -> Result<ExpiryTime, ParseError> {
 		match parse_int_be::<u64, u5>(field_data, 32)
-			.map(|t| ExpiryTime::from_seconds(t))
+			.map(ExpiryTime::from_seconds)
 		{
 			Some(t) => Ok(t),
 			None => Err(ParseError::IntegerOverflowError),
@@ -523,13 +521,13 @@ impl FromBase32 for ExpiryTime {
 	}
 }
 
-impl FromBase32 for MinFinalCltvExpiry {
+impl FromBase32 for MinFinalCltvExpiryDelta {
 	type Err = ParseError;
 
-	fn from_base32(field_data: &[u5]) -> Result<MinFinalCltvExpiry, ParseError> {
+	fn from_base32(field_data: &[u5]) -> Result<MinFinalCltvExpiryDelta, ParseError> {
 		let expiry = parse_int_be::<u64, u5>(field_data, 32);
 		if let Some(expiry) = expiry {
-			Ok(MinFinalCltvExpiry(expiry))
+			Ok(MinFinalCltvExpiryDelta(expiry))
 		} else {
 			Err(ParseError::IntegerOverflowError)
 		}
@@ -540,7 +538,7 @@ impl FromBase32 for Fallback {
 	type Err = ParseError;
 
 	fn from_base32(field_data: &[u5]) -> Result<Fallback, ParseError> {
-		if field_data.len() < 1 {
+		if field_data.is_empty() {
 			return Err(ParseError::UnexpectedEndOfTaggedFields);
 		}
 
@@ -554,7 +552,7 @@ impl FromBase32 for Fallback {
 				}
 
 				Ok(Fallback::SegWitProgram {
-					version: version,
+					version,
 					program: bytes
 				})
 			},
@@ -840,14 +838,14 @@ mod test {
 	}
 
 	#[test]
-	fn test_parse_min_final_cltv_expiry() {
-		use crate::MinFinalCltvExpiry;
+	fn test_parse_min_final_cltv_expiry_delta() {
+		use crate::MinFinalCltvExpiryDelta;
 		use bech32::FromBase32;
 
 		let input = from_bech32("pr".as_bytes());
-		let expected = Ok(MinFinalCltvExpiry(35));
+		let expected = Ok(MinFinalCltvExpiryDelta(35));
 
-		assert_eq!(MinFinalCltvExpiry::from_base32(&input), expected);
+		assert_eq!(MinFinalCltvExpiryDelta::from_base32(&input), expected);
 	}
 
 	#[test]
